@@ -42,16 +42,16 @@ fail() {
   exit 1
 }
 
-# The candidate runs as UID 10001. Terminate any process it left behind before
+# The candidate runs as UID 1000. Terminate any process it left behind before
 # verifier assets are used, then ensure no such process survives this boundary.
-pkill -KILL -u 10001 2>/dev/null || true
+pkill -KILL -u 1000 2>/dev/null || true
 for _ in 1 2 3 4 5; do
-  if ! pgrep -u 10001 >/dev/null 2>&1; then
+  if ! pgrep -u 1000 >/dev/null 2>&1; then
     break
   fi
   /usr/bin/sleep 0.1
 done
-if pgrep -u 10001 >/dev/null 2>&1; then
+if pgrep -u 1000 >/dev/null 2>&1; then
   fail "candidate-owned process survived the agent/verifier boundary"
 fi
 
@@ -92,7 +92,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="e602fa04ff36afe9b94c208898b3c87209876292a09abf7eb1ada779294e5228"
+  ["Dockerfile"]="df3cd96d39ebd3f770e1c4df7f3509d6b08bd9aca52222accc1bfe4b5ff0a099"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
