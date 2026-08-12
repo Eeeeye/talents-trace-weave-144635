@@ -124,7 +124,13 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 (( file_count <= 800 )) || fail "workspace contains too many files: ${file_count}"
 (( byte_count <= 30000000 )) || fail "workspace is unexpectedly large: ${byte_count} bytes"
 
-scratch="$(mktemp -d "${verifier_root}/.traceweave-verifier.XXXXXX")"
+# Keep all transient build and fixture data on the container's writable
+# overlay. Grading workers may mount both /tmp and /logs with small independent
+# quotas: /tmp is shared scratch, while /logs is reserved for verifier
+# artifacts. Only reward.txt and the concise verifier log belong under /logs.
+# mktemp creates this root-owned directory before any candidate code is run.
+[[ -d /var/tmp && ! -L /var/tmp ]] || fail "/var/tmp is missing or is a symlink"
+scratch="$(mktemp -d /var/tmp/.traceweave-verifier.XXXXXX)"
 chown 0:0 "${scratch}"
 # Candidate builds run below a dropped UID and must traverse this parent, but
 # cannot list it. Verifier sources remain separately protected at /tests.
@@ -196,16 +202,17 @@ chmod 0555 "${binary_root}/tracegen" "${binary_root}/traceweave" "${binary_root}
 (cd "${source_root}" && run_as_builder /usr/local/go/bin/go test -buildvcs=false -race ./...)
 
 printf '[verifier] compile independent byte-level verifier\n'
-GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+TMPDIR="${runtime_root}/tmp" \
+GOCACHE="${runtime_root}/go-cache" \
+GOMODCACHE="${runtime_root}/go-mod-cache" \
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOENV=off \
   go build -trimpath -buildvcs=false -o "${scratch}/verifier" /tests/verifier.go
 chown 0:0 "${scratch}/verifier"
 chmod 0500 "${scratch}/verifier"
 
-# Keep generated fixtures on the verifier artifact filesystem.  Some grading
-# workers mount /tmp with a small, shared quota; an exhausted /tmp must not turn
-# a correct solution into a nondeterministic reward-zero result.  The scratch
-# directory already lives under /logs/verifier, is root controlled, and is
-# removed by the EXIT trap.
+# Keep generated fixtures in the same root-controlled overlay scratch. They
+# must not consume either the shared /tmp quota or the /logs artifact quota.
+# The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
 install -d -o 0 -g 0 -m 0711 "${case_root}"
 "${scratch}/verifier" \
