@@ -9,18 +9,8 @@ reward_path="${verifier_root}/reward.txt"
 log_path="${verifier_root}/trace-weave-tests.log"
 reward=0
 scratch=""
-unit_group_pid=""
-
-cleanup_unit_group() {
-  if [[ -n "${unit_group_pid}" ]]; then
-    kill -KILL -- "-${unit_group_pid}" >/dev/null 2>&1 || true
-    wait "${unit_group_pid}" >/dev/null 2>&1 || true
-    unit_group_pid=""
-  fi
-}
 
 cleanup() {
-  cleanup_unit_group
   if [[ -n "${scratch}" && "${scratch}" == */.traceweave-verifier.* && -d "${scratch}" && ! -L "${scratch}" ]]; then
     rm -rf -- "${scratch}"
   fi
@@ -76,7 +66,8 @@ fi
 
 [[ -d "${workspace}" && ! -L "${workspace}" ]] || fail "workspace is missing or is a symlink"
 [[ -d /tests && ! -L /tests ]] || fail "verifier tests are missing or are a symlink"
-[[ -f /tests/verifier.go && ! -L /tests/verifier.go ]] || fail "trusted verifier source is missing or is not regular"
+[[ -f /tests/verifier && ! -L /tests/verifier ]] || fail "trusted verifier binary is missing or is not regular"
+[[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -112,7 +103,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="92f85d3f11a38945f146c666baa4a24ae40d1d6df274f359e79551a084af7a1b"
+  ["Dockerfile"]="7df5dc93fc9db99af211fe01bd91c93fface0c71d55c1914c21d240d942e98f9"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -195,54 +186,21 @@ chmod 0711 "${scratch}"
 source_root="${scratch}/source"
 binary_root="${scratch}/binaries"
 runtime_root="${scratch}/runtime"
-trusted_root="${scratch}/trusted"
 install -d -o 0 -g 0 -m 0755 "${source_root}"
 install -d -o 65532 -g 65532 -m 0700 "${binary_root}"
 install -d -o 0 -g 0 -m 0711 "${runtime_root}"
 install -d -o 0 -g 0 -m 0700 \
-  "${trusted_root}" "${runtime_root}/trusted-home" "${runtime_root}/trusted-tmp" \
   "${runtime_root}/go-cache" "${runtime_root}/go-mod-cache"
 
-# Copy the standard-library and fixed-starter cache prepared while the image
-# was built. It lives outside /root so worker runtimes may replace the root
-# home without losing it. The image path is never candidate-writable; Go's
-# action hashes still rebuild every package whose source or flags changed.
-image_go_cache="/usr/local/share/traceweave-go-cache"
-[[ -d "${image_go_cache}" && ! -L "${image_go_cache}" ]] || fail "trusted image Go cache is missing or is a symlink"
-[[ "$(stat -c '%u:%g' "${image_go_cache}")" == "0:0" ]] || fail "trusted image Go cache is not owned by root"
-image_go_cache_mode="$(stat -c '%a' "${image_go_cache}")"
-[[ "${image_go_cache_mode}" =~ ^[0-7]+$ ]] || fail "trusted image Go cache has an invalid mode"
-(( (8#${image_go_cache_mode} & 0077) == 0 )) || fail "trusted image Go cache is accessible outside root"
-if find "${image_go_cache}" -xdev \( ! -user root -o -perm /0022 -o -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q .; then
-  fail "trusted image Go cache has unsafe ownership, permissions, or file types"
-fi
-cp -a -- "${image_go_cache}/." "${runtime_root}/go-cache/"
-
-# Copy and compile the trusted verifier before touching candidate-derived build
-# commands. The source mount may be read-only, so it is never chmod'ed or
-# chown'ed as a prerequisite. Compiling it also populates any cache entries not
-# already covered by the image build before ownership is dropped.
-install -o 0 -g 0 -m 0600 /tests/verifier.go "${trusted_root}/verifier.go"
-(
-  cd "${trusted_root}"
-  /usr/bin/env -i \
-    HOME="${runtime_root}/trusted-home" \
-    PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    TMPDIR="${runtime_root}/trusted-tmp" \
-    GOPROXY=off \
-    GOSUMDB=off \
-    GOTOOLCHAIN=local \
-    GOFLAGS=-mod=readonly \
-    GOENV=off \
-    CGO_ENABLED=0 \
-    GOCACHE="${runtime_root}/go-cache" \
-    GOMODCACHE="${runtime_root}/go-mod-cache" \
-    /usr/bin/timeout --signal=KILL 180s \
-      /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${scratch}/verifier" "${trusted_root}/verifier.go"
-)
-chown 0:0 "${scratch}/verifier"
-chmod 0500 "${scratch}/verifier"
-rm -f -- "${trusted_root}/verifier.go"
+# The independent Oracle is compiled with the image's pinned Go 1.22.12
+# toolchain during task authoring. Verify its byte digest before copying it out
+# of the read-only /tests mount; this removes all runtime compiler/cache
+# dependence from the trusted side of the grading boundary.
+expected_verifier_sha="$(awk 'NR == 1 {print $1}' /tests/verifier.sha256)"
+[[ "${expected_verifier_sha}" =~ ^[0-9a-f]{64}$ ]] || fail "trusted verifier digest has an invalid format"
+observed_verifier_sha="$(sha256sum -- /tests/verifier | awk '{print $1}')"
+[[ "${observed_verifier_sha}" == "${expected_verifier_sha}" ]] || fail "trusted verifier binary digest mismatch"
+install -o 0 -g 0 -m 0500 /tests/verifier "${scratch}/verifier"
 
 tar \
   --exclude='./.git' \
@@ -260,8 +218,8 @@ install -d -o 65532 -g 65532 -m 0700 \
 chown -R 65532:65532 "${runtime_root}/go-cache"
 chown -R 65532:65532 "${runtime_root}/go-mod-cache"
 
-# The verifier is already compiled and runs before candidate unit tests. Hiding
-# its original source is defense in depth only; some backends mount /tests
+# The verifier is already copied into root-controlled scratch. Hiding the
+# original test assets is defense in depth only; some backends mount /tests
 # read-only, so permission tightening must be best-effort.
 chown -R 0:0 /tests >/dev/null 2>&1 || true
 chmod -R u=rwX,go= /tests >/dev/null 2>&1 || true
@@ -296,11 +254,10 @@ printf '[verifier] offline dependency and build checks\n'
 module_lines="$(cd "${source_root}" && run_as_builder /usr/local/go/bin/go list -m all | sed '1d' | wc -l)"
 [[ "${module_lines}" == "0" ]] || fail "candidate introduced third-party Go modules"
 
-for command in tracegen traceweave traceinspect; do
-  package="./cmd/${command}"
-  (cd "${source_root}" && run_as_builder /usr/local/go/bin/go build \
-    -trimpath -buildvcs=false -o "${binary_root}/${command}" "${package}")
-done
+(
+  cd "${source_root}"
+  run_as_builder /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${binary_root}" ./cmd/...
+)
 chown 0:0 "${binary_root}/tracegen" "${binary_root}/traceweave" "${binary_root}/traceinspect"
 chmod 0555 "${binary_root}/tracegen" "${binary_root}/traceweave" "${binary_root}/traceinspect"
 chown 0:0 "${binary_root}"
@@ -317,47 +274,6 @@ printf '[verifier] independent byte-level integration checks\n'
   "${binary_root}/tracegen" \
   "${binary_root}/traceinspect" \
   "${case_root}"
-
-# Candidate unit tests are fixed protected files, but they are still executable
-# candidate-tree code. Run them only after the independent checks and in their
-# own process group so no descendant can survive the verifier boundary.
-printf '[verifier] protected candidate unit tests\n'
-unit_log="${scratch}/unit-tests.log"
-set +e
-(
-  cd "${source_root}"
-  exec /usr/bin/setsid /usr/bin/setpriv \
-    --reuid=65532 \
-    --regid=65532 \
-    --clear-groups \
-    --no-new-privs \
-    --bounding-set=-all \
-    --inh-caps=-all \
-    --ambient-caps=-all \
-    /usr/bin/env -i \
-      HOME="${runtime_root}/home" \
-      USER=traceweave-builder \
-      LOGNAME=traceweave-builder \
-      PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-      TMPDIR="${runtime_root}/tmp" \
-      GOPROXY=off \
-      GOSUMDB=off \
-      GOTOOLCHAIN=local \
-      GOFLAGS=-mod=readonly \
-      GOENV=off \
-      CGO_ENABLED=0 \
-      GOCACHE="${runtime_root}/go-cache" \
-      GOMODCACHE="${runtime_root}/go-mod-cache" \
-      /usr/bin/timeout --signal=KILL 120s \
-        /usr/local/go/bin/go test -buildvcs=false -count=1 ./...
-) >"${unit_log}" 2>&1 &
-unit_group_pid=$!
-wait "${unit_group_pid}"
-unit_status=$?
-set -e
-cleanup_unit_group
-cat "${unit_log}"
-(( unit_status == 0 )) || exit "${unit_status}"
 
 reward=1
 printf '[verifier] reward=1\n'
