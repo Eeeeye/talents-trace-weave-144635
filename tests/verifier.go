@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -374,6 +375,12 @@ func testEmptyJob(traceweave, root string) error {
 }
 
 func testFailureSafety(traceweave, root string) error {
+	if err := testStrictManifest(traceweave, root); err != nil {
+		return err
+	}
+	if err := testSourceInvariants(traceweave, root); err != nil {
+		return err
+	}
 	if err := testBadCRC(traceweave, root); err != nil {
 		return err
 	}
@@ -385,6 +392,174 @@ func testFailureSafety(traceweave, root string) error {
 	}
 	if err := testExistingArtifacts(traceweave, root); err != nil {
 		return err
+	}
+	if err := testInvalidResumeStates(traceweave, root); err != nil {
+		return err
+	}
+	return nil
+}
+
+func testStrictManifest(traceweave, root string) error {
+	type manifestCase struct {
+		name   string
+		mutate func([]byte) ([]byte, error)
+	}
+	objectMutation := func(mutate func(map[string]json.RawMessage)) func([]byte) ([]byte, error) {
+		return func(data []byte) ([]byte, error) {
+			return rewriteJSONObject(data, func(object map[string]json.RawMessage) error {
+				mutate(object)
+				return nil
+			})
+		}
+	}
+	documentMutation := func(mutate func(*manifestDoc)) func([]byte) ([]byte, error) {
+		return func(data []byte) ([]byte, error) {
+			var document manifestDoc
+			if err := decodeOneJSON(data, &document, true); err != nil {
+				return nil, err
+			}
+			mutate(&document)
+			return marshalJSON(document)
+		}
+	}
+	cases := []manifestCase{
+		{"unknown top-level field", objectMutation(func(object map[string]json.RawMessage) {
+			object["verifier_unknown"] = json.RawMessage(`true`)
+		})},
+		{"trailing JSON value", func(data []byte) ([]byte, error) {
+			return append(append([]byte(nil), bytes.TrimSpace(data)...), []byte("\n{\"trailing\":true}\n")...), nil
+		}},
+		{"missing required format_version", objectMutation(func(object map[string]json.RawMessage) {
+			delete(object, "format_version")
+		})},
+		{"wrong-type world_size", objectMutation(func(object map[string]json.RawMessage) {
+			object["world_size"] = json.RawMessage(`"two"`)
+		})},
+		{"input missing record_count", func(data []byte) ([]byte, error) {
+			return mutateManifestInput(data, 0, func(object map[string]json.RawMessage) {
+				delete(object, "record_count")
+			})
+		}},
+		{"input unknown field", func(data []byte) ([]byte, error) {
+			return mutateManifestInput(data, 0, func(object map[string]json.RawMessage) {
+				object["verifier_unknown"] = json.RawMessage(`true`)
+			})
+		}},
+		{"unsupported format version", documentMutation(func(document *manifestDoc) {
+			document.FormatVersion = 2
+		})},
+		{"empty job ID", documentMutation(func(document *manifestDoc) {
+			document.JobID = ""
+		})},
+		{"zero epoch", documentMutation(func(document *manifestDoc) {
+			document.Epoch = 0
+		})},
+		{"world size and input count mismatch", documentMutation(func(document *manifestDoc) {
+			document.WorldSize++
+		})},
+		{"duplicate rank", documentMutation(func(document *manifestDoc) {
+			document.Inputs[1].Rank = document.Inputs[0].Rank
+		})},
+		{"rank outside world size", documentMutation(func(document *manifestDoc) {
+			document.Inputs[0].Rank = document.WorldSize
+		})},
+		{"duplicate path", documentMutation(func(document *manifestDoc) {
+			document.Inputs[1].Path = document.Inputs[0].Path
+		})},
+		{"empty input path", documentMutation(func(document *manifestDoc) {
+			document.Inputs[0].Path = ""
+		})},
+		{"record count above bound", documentMutation(func(document *manifestDoc) {
+			document.Inputs[0].RecordCount = 1_000_000_001
+		})},
+		{"negative read delay", documentMutation(func(document *manifestDoc) {
+			document.Inputs[0].ReadDelayMS = -1
+		})},
+		{"read delay above bound", documentMutation(func(document *manifestDoc) {
+			document.Inputs[0].ReadDelayMS = 60_001
+		})},
+	}
+
+	for index, test := range cases {
+		ds, err := createDataset(filepath.Join(root, fmt.Sprintf("strict-manifest-%02d", index)),
+			"strict-manifest", makeRecords(21001+uint64(index), []int{2, 1}, 191+uint64(index)),
+			map[uint32]int{}, configDoc{
+				CheckpointEveryRecords: 1, ReadChunkBytes: 1, ChannelCapacity: 2,
+				OutputBufferBytes: 1024, MaxPayloadBytes: 4096,
+			})
+		if err != nil {
+			return err
+		}
+		original, err := os.ReadFile(ds.ManifestPath)
+		if err != nil {
+			return err
+		}
+		invalid, err := test.mutate(original)
+		if err != nil {
+			return fmt.Errorf("prepare manifest case %q: %w", test.name, err)
+		}
+		if err := os.WriteFile(ds.ManifestPath, invalid, 0o600); err != nil {
+			return err
+		}
+		if err := refreshInputDigests(ds); err != nil {
+			return err
+		}
+		if err := expectInputFailure(traceweave, ds, "manifest "+test.name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func testSourceInvariants(traceweave, root string) error {
+	type sourceCase struct {
+		name   string
+		mutate func([]byte, []event) error
+	}
+	cases := []sourceCase{
+		{"decreasing per-rank timestamp", func(data []byte, records []event) error {
+			if records[0].Timestamp == 0 {
+				return errors.New("source fixture timestamp cannot be decremented")
+			}
+			binary.BigEndian.PutUint64(data[records[1].Start+24:records[1].Start+32], records[0].Timestamp-1)
+			return nil
+		}},
+		{"duplicate positive rank-local sequence", func(data []byte, records []event) error {
+			binary.BigEndian.PutUint64(data[records[1].Start+16:records[1].Start+24], records[0].Sequence)
+			return nil
+		}},
+	}
+	for index, test := range cases {
+		ds, err := createDataset(filepath.Join(root, fmt.Sprintf("source-invariant-%02d", index)),
+			"source-invariant", makeRecords(22001+uint64(index), []int{4}, 223+uint64(index)),
+			map[uint32]int{}, configDoc{
+				CheckpointEveryRecords: 1, ReadChunkBytes: 2, ChannelCapacity: 2,
+				OutputBufferBytes: 1024, MaxPayloadBytes: 4096,
+			})
+		if err != nil {
+			return err
+		}
+		spool := ds.SpoolPaths[0]
+		data, err := os.ReadFile(spool)
+		if err != nil {
+			return err
+		}
+		records := ds.RecordsByRank[0]
+		if len(records) < 2 {
+			return errors.New("source invariant fixture has fewer than two records")
+		}
+		if err := test.mutate(data, records); err != nil {
+			return err
+		}
+		if err := os.WriteFile(spool, data, 0o600); err != nil {
+			return err
+		}
+		if err := refreshInputDigests(ds); err != nil {
+			return err
+		}
+		if err := expectInputFailure(traceweave, ds, test.name); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -440,43 +615,101 @@ func testTruncatedFrame(traceweave, root string) error {
 }
 
 func testStrictConfig(traceweave, root string) error {
-	ds, err := createDataset(filepath.Join(root, "strict-json"), "strict-json",
-		makeRecords(3003, []int{2}, 107), map[uint32]int{}, configDoc{
-			CheckpointEveryRecords: 1, ReadChunkBytes: 0, ChannelCapacity: 1,
-			OutputBufferBytes: 1024, MaxPayloadBytes: 4096,
-		})
-	if err != nil {
-		return err
+	type configCase struct {
+		name   string
+		mutate func([]byte) ([]byte, error)
 	}
-	data, err := os.ReadFile(ds.ConfigPath)
-	if err != nil {
-		return err
+	objectMutation := func(mutate func(map[string]json.RawMessage)) func([]byte) ([]byte, error) {
+		return func(data []byte) ([]byte, error) {
+			return rewriteJSONObject(data, func(object map[string]json.RawMessage) error {
+				mutate(object)
+				return nil
+			})
+		}
 	}
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) == 0 || trimmed[len(trimmed)-1] != '}' {
-		return errors.New("unexpected generated config")
+	documentMutation := func(mutate func(*configDoc)) func([]byte) ([]byte, error) {
+		return func(data []byte) ([]byte, error) {
+			var document configDoc
+			if err := decodeOneJSON(data, &document, true); err != nil {
+				return nil, err
+			}
+			mutate(&document)
+			return marshalJSON(document)
+		}
 	}
-	trimmed = append(trimmed[:len(trimmed)-1], []byte(",\n  \"verifier_unknown\": true\n}\n")...)
-	if err := os.WriteFile(ds.ConfigPath, trimmed, 0o600); err != nil {
-		return err
+	cases := []configCase{
+		{"unknown field", objectMutation(func(object map[string]json.RawMessage) {
+			object["verifier_unknown"] = json.RawMessage(`true`)
+		})},
+		{"trailing JSON value", func(data []byte) ([]byte, error) {
+			return append(append([]byte(nil), bytes.TrimSpace(data)...), []byte("\nnull\n")...), nil
+		}},
+		{"missing manifest", objectMutation(func(object map[string]json.RawMessage) {
+			delete(object, "manifest")
+		})},
+		{"wrong-type checkpoint interval", objectMutation(func(object map[string]json.RawMessage) {
+			object["checkpoint_every_records"] = json.RawMessage(`"one"`)
+		})},
+		{"same output and checkpoint", documentMutation(func(document *configDoc) {
+			document.Checkpoint = document.Output
+		})},
+		{"zero checkpoint interval", documentMutation(func(document *configDoc) {
+			document.CheckpointEveryRecords = 0
+		})},
+		{"negative read chunk", documentMutation(func(document *configDoc) {
+			document.ReadChunkBytes = -1
+		})},
+		{"negative channel capacity", documentMutation(func(document *configDoc) {
+			document.ChannelCapacity = -1
+		})},
+		{"too-small output buffer", documentMutation(func(document *configDoc) {
+			document.OutputBufferBytes = 255
+		})},
+		{"zero maximum payload", documentMutation(func(document *configDoc) {
+			document.MaxPayloadBytes = 0
+		})},
 	}
-	if err := chownTree(ds.Root, candidateUID, candidateGID); err != nil {
-		return err
+	for index, test := range cases {
+		ds, err := createDataset(filepath.Join(root, fmt.Sprintf("strict-config-%02d", index)), "strict-config",
+			makeRecords(3003+uint64(index), []int{2}, 107+uint64(index)), map[uint32]int{}, configDoc{
+				CheckpointEveryRecords: 1, ReadChunkBytes: 0, ChannelCapacity: 1,
+				OutputBufferBytes: 1024, MaxPayloadBytes: 4096,
+			})
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(ds.ConfigPath)
+		if err != nil {
+			return err
+		}
+		invalid, err := test.mutate(data)
+		if err != nil {
+			return fmt.Errorf("prepare config case %q: %w", test.name, err)
+		}
+		if err := os.WriteFile(ds.ConfigPath, invalid, 0o600); err != nil {
+			return err
+		}
+		if err := chownTree(ds.Root, candidateUID, candidateGID); err != nil {
+			return err
+		}
+		result, err := runCandidate(traceweave, ds.Root, 15*time.Second, "-config", ds.ConfigPath)
+		if err != nil {
+			return err
+		}
+		if result.ExitCode == 0 {
+			return fmt.Errorf("invalid configuration %q was accepted", test.name)
+		}
+		if _, err := os.Stat(ds.OutputPath); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("strict config failure %q created output: %v", test.name, err)
+		}
+		if _, err := os.Stat(ds.CheckpointPath); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("strict config failure %q created checkpoint: %v", test.name, err)
+		}
+		if err := verifyInputsUnchanged(ds); err != nil {
+			return err
+		}
 	}
-	result, err := runCandidate(traceweave, ds.Root, 15*time.Second, "-config", ds.ConfigPath)
-	if err != nil {
-		return err
-	}
-	if result.ExitCode == 0 {
-		return errors.New("configuration with an unknown field was accepted")
-	}
-	if _, err := os.Stat(ds.OutputPath); !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("strict config failure created output: %v", err)
-	}
-	if _, err := os.Stat(ds.CheckpointPath); !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("strict config failure created checkpoint: %v", err)
-	}
-	return verifyInputsUnchanged(ds)
+	return nil
 }
 
 func testExistingArtifacts(traceweave, root string) error {
@@ -552,6 +785,212 @@ func testExistingArtifacts(traceweave, root string) error {
 		return fmt.Errorf("existing-checkpoint failure created output: %v", err)
 	}
 	return nil
+}
+
+func testInvalidResumeStates(traceweave, root string) error {
+	ds, err := createDataset(filepath.Join(root, "invalid-resume"), "invalid-resume",
+		makeRecords(23001, []int{11, 9}, 251), map[uint32]int{0: 1, 1: 0}, configDoc{
+			CheckpointEveryRecords: 5, ReadChunkBytes: 3, ChannelCapacity: 16,
+			OutputBufferBytes: 4096, MaxPayloadBytes: 4096,
+		})
+	if err != nil {
+		return err
+	}
+	if err := chownTree(ds.Root, candidateUID, candidateGID); err != nil {
+		return err
+	}
+	crash, err := runCandidate(traceweave, ds.Root, 30*time.Second,
+		"-config", ds.ConfigPath, "-crash-after-checkpoints", "1")
+	if err != nil {
+		return err
+	}
+	if crash.ExitCode != 86 {
+		return commandFailure("invalid-resume fixture crash (wanted exit 86)", crash)
+	}
+	_, baseOutput, baseCheckpoint, err := validateCrashPrefix(ds, 5)
+	if err != nil {
+		return err
+	}
+
+	type resumeCase struct {
+		name   string
+		mutate func(*checkpointDoc, []byte, []byte) ([]byte, []byte, error)
+	}
+	stateMutation := func(mutate func(*checkpointDoc)) func(*checkpointDoc, []byte, []byte) ([]byte, []byte, error) {
+		return func(state *checkpointDoc, _ []byte, output []byte) ([]byte, []byte, error) {
+			mutate(state)
+			encoded, err := marshalJSON(state)
+			return encoded, append([]byte(nil), output...), err
+		}
+	}
+	rawMutation := func(mutate func(map[string]json.RawMessage)) func(*checkpointDoc, []byte, []byte) ([]byte, []byte, error) {
+		return func(_ *checkpointDoc, checkpointBytes, output []byte) ([]byte, []byte, error) {
+			encoded, err := rewriteJSONObject(checkpointBytes, func(object map[string]json.RawMessage) error {
+				mutate(object)
+				return nil
+			})
+			return encoded, append([]byte(nil), output...), err
+		}
+	}
+	firstRank := uint32(0)
+	firstRankKey := strconv.FormatUint(uint64(firstRank), 10)
+	firstRecord := ds.RecordsByRank[firstRank][0]
+	cases := []resumeCase{
+		{"checkpoint unknown field", rawMutation(func(object map[string]json.RawMessage) {
+			object["verifier_unknown"] = json.RawMessage(`true`)
+		})},
+		{"checkpoint trailing JSON value", func(_ *checkpointDoc, checkpointBytes, output []byte) ([]byte, []byte, error) {
+			checkpointBytes = append(append([]byte(nil), bytes.TrimSpace(checkpointBytes)...), []byte("\nfalse\n")...)
+			return checkpointBytes, append([]byte(nil), output...), nil
+		}},
+		{"checkpoint missing updated_at", rawMutation(func(object map[string]json.RawMessage) {
+			delete(object, "updated_at")
+		})},
+		{"checkpoint wrong-type output_records", rawMutation(func(object map[string]json.RawMessage) {
+			object["output_records"] = json.RawMessage(`"five"`)
+		})},
+		{"last key missing sequence", rawMutation(func(object map[string]json.RawMessage) {
+			var lastKey map[string]json.RawMessage
+			_ = json.Unmarshal(object["last_key"], &lastKey)
+			delete(lastKey, "sequence")
+			object["last_key"], _ = json.Marshal(lastKey)
+		})},
+		{"last key unknown field", rawMutation(func(object map[string]json.RawMessage) {
+			var lastKey map[string]json.RawMessage
+			_ = json.Unmarshal(object["last_key"], &lastKey)
+			lastKey["verifier_unknown"] = json.RawMessage(`true`)
+			object["last_key"], _ = json.Marshal(lastKey)
+		})},
+		{"unsupported checkpoint format version", stateMutation(func(state *checkpointDoc) {
+			state.FormatVersion = 2
+		})},
+		{"malformed manifest hash", stateMutation(func(state *checkpointDoc) {
+			state.ManifestSHA256 = strings.Repeat("g", 64)
+		})},
+		{"manifest hash mismatch", stateMutation(func(state *checkpointDoc) {
+			state.ManifestSHA256 = strings.Repeat("0", 64)
+		})},
+		{"configured output path mismatch", stateMutation(func(state *checkpointDoc) {
+			state.OutputPath = filepath.Join(ds.Root, "other-output.twseg")
+		})},
+		{"completed checkpoint", stateMutation(func(state *checkpointDoc) {
+			state.Completed = true
+		})},
+		{"missing source rank", stateMutation(func(state *checkpointDoc) {
+			delete(state.SourceOffsets, firstRankKey)
+		})},
+		{"noncanonical source rank key", stateMutation(func(state *checkpointDoc) {
+			value := state.SourceOffsets[firstRankKey]
+			delete(state.SourceOffsets, firstRankKey)
+			state.SourceOffsets["00"] = value
+		})},
+		{"source rank outside manifest", stateMutation(func(state *checkpointDoc) {
+			value := state.SourceOffsets[firstRankKey]
+			delete(state.SourceOffsets, firstRankKey)
+			state.SourceOffsets[strconv.FormatUint(uint64(ds.World), 10)] = value
+		})},
+		{"negative source offset", stateMutation(func(state *checkpointDoc) {
+			state.SourceOffsets[firstRankKey] = -1
+		})},
+		{"source offset before spool body", stateMutation(func(state *checkpointDoc) {
+			state.SourceOffsets[firstRankKey] = spoolHeaderSize - 1
+		})},
+		{"source offset beyond EOF", stateMutation(func(state *checkpointDoc) {
+			state.SourceOffsets[firstRankKey] = ds.SpoolSizes[firstRank] + 1
+		})},
+		{"source offset inside a frame", stateMutation(func(state *checkpointDoc) {
+			state.SourceOffsets[firstRankKey] = firstRecord.Start + 1
+		})},
+		{"valid source boundary disagrees with prefix", stateMutation(func(state *checkpointDoc) {
+			state.SourceOffsets[firstRankKey] = spoolHeaderSize
+		})},
+		{"output record count disagrees with prefix", stateMutation(func(state *checkpointDoc) {
+			state.OutputRecords++
+		})},
+		{"last key disagrees with prefix", stateMutation(func(state *checkpointDoc) {
+			state.LastKey.Sequence++
+		})},
+		{"minimum timestamp disagrees with prefix", stateMutation(func(state *checkpointDoc) {
+			state.MinTimestamp--
+		})},
+		{"maximum timestamp disagrees with prefix", stateMutation(func(state *checkpointDoc) {
+			state.MaxTimestamp++
+		})},
+		{"output byte boundary inside a frame", stateMutation(func(state *checkpointDoc) {
+			state.OutputBytes--
+		})},
+		{"output byte boundary before segment body", stateMutation(func(state *checkpointDoc) {
+			state.OutputBytes = segmentHeadSize - 1
+		})},
+		{"checkpointed output record differs from source", func(_ *checkpointDoc, checkpointBytes, output []byte) ([]byte, []byte, error) {
+			mutated := append([]byte(nil), output...)
+			length := int(binary.BigEndian.Uint32(mutated[segmentHeadSize+4 : segmentHeadSize+8]))
+			if length == 0 {
+				return nil, nil, errors.New("resume fixture first record has no payload")
+			}
+			payload := mutated[segmentHeadSize+recordHeaderSize : segmentHeadSize+recordHeaderSize+length]
+			payload[0] ^= 0xff
+			binary.BigEndian.PutUint32(mutated[segmentHeadSize+32:segmentHeadSize+36], crc32.ChecksumIEEE(payload))
+			return append([]byte(nil), checkpointBytes...), mutated, nil
+		}},
+		{"segment world size mismatch", func(_ *checkpointDoc, checkpointBytes, output []byte) ([]byte, []byte, error) {
+			mutated := append([]byte(nil), output...)
+			binary.BigEndian.PutUint32(mutated[8:12], ds.World+1)
+			return append([]byte(nil), checkpointBytes...), mutated, nil
+		}},
+		{"segment epoch mismatch", func(_ *checkpointDoc, checkpointBytes, output []byte) ([]byte, []byte, error) {
+			mutated := append([]byte(nil), output...)
+			binary.BigEndian.PutUint64(mutated[16:24], ds.Epoch+1)
+			return append([]byte(nil), checkpointBytes...), mutated, nil
+		}},
+	}
+
+	for _, test := range cases {
+		var state checkpointDoc
+		if err := decodeOneJSON(baseCheckpoint, &state, true); err != nil {
+			return err
+		}
+		checkpointBytes, outputBytes, err := test.mutate(&state, baseCheckpoint, baseOutput)
+		if err != nil {
+			return fmt.Errorf("prepare resume case %q: %w", test.name, err)
+		}
+		if err := os.WriteFile(ds.OutputPath, outputBytes, 0o600); err != nil {
+			return err
+		}
+		if err := os.WriteFile(ds.CheckpointPath, checkpointBytes, 0o600); err != nil {
+			return err
+		}
+		if err := expectResumeFailure(traceweave, ds, test.name, outputBytes, checkpointBytes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func expectResumeFailure(traceweave string, ds *dataset, label string, outputBefore, checkpointBefore []byte) error {
+	result, err := runCandidate(traceweave, ds.Root, 15*time.Second,
+		"-config", ds.ConfigPath, "-resume")
+	if err != nil {
+		return err
+	}
+	if result.ExitCode == 0 {
+		return fmt.Errorf("invalid resume state %q was accepted", label)
+	}
+	outputAfter, err := os.ReadFile(ds.OutputPath)
+	if err != nil {
+		return err
+	}
+	checkpointAfter, err := os.ReadFile(ds.CheckpointPath)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(outputBefore, outputAfter) {
+		return fmt.Errorf("failed resume %q modified output bytes", label)
+	}
+	if !bytes.Equal(checkpointBefore, checkpointAfter) {
+		return fmt.Errorf("failed resume %q modified checkpoint bytes", label)
+	}
+	return verifyInputsUnchanged(ds)
 }
 
 func expectInputFailure(traceweave string, ds *dataset, label string) error {
@@ -1030,6 +1469,49 @@ func decodeOneJSON(data []byte, destination any, strict bool) error {
 	return nil
 }
 
+func marshalJSON(value any) ([]byte, error) {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func rewriteJSONObject(data []byte, mutate func(map[string]json.RawMessage) error) ([]byte, error) {
+	var object map[string]json.RawMessage
+	if err := decodeOneJSON(data, &object, false); err != nil {
+		return nil, err
+	}
+	if err := mutate(object); err != nil {
+		return nil, err
+	}
+	return marshalJSON(object)
+}
+
+func mutateManifestInput(data []byte, index int, mutate func(map[string]json.RawMessage)) ([]byte, error) {
+	return rewriteJSONObject(data, func(manifest map[string]json.RawMessage) error {
+		var inputs []json.RawMessage
+		if err := json.Unmarshal(manifest["inputs"], &inputs); err != nil {
+			return err
+		}
+		if index < 0 || index >= len(inputs) {
+			return fmt.Errorf("manifest input index %d is outside fixture", index)
+		}
+		var input map[string]json.RawMessage
+		if err := json.Unmarshal(inputs[index], &input); err != nil {
+			return err
+		}
+		mutate(input)
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			return err
+		}
+		inputs[index] = encoded
+		manifest["inputs"], err = json.Marshal(inputs)
+		return err
+	})
+}
+
 func runCandidate(binary, workdir string, timeout time.Duration, arguments ...string) (commandResult, error) {
 	home := filepath.Join(workdir, ".candidate-home")
 	temporary := filepath.Join(workdir, ".candidate-tmp")
@@ -1140,11 +1622,10 @@ func fileSHA256(path string) (string, error) {
 }
 
 func writeJSON(path string, value any) ([]byte, error) {
-	data, err := json.MarshalIndent(value, "", "  ")
+	data, err := marshalJSON(value)
 	if err != nil {
 		return nil, err
 	}
-	data = append(data, '\n')
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
