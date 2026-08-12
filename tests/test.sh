@@ -201,9 +201,12 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
 chown 0:0 "${scratch}/verifier"
 chmod 0500 "${scratch}/verifier"
 
-case_root="$(mktemp -d /tmp/traceweave-cases.XXXXXX)"
-chown 0:0 "${case_root}"
-chmod 0711 "${case_root}"
+# Keep generated fixtures on the verifier artifact filesystem. Some grading
+# workers mount /tmp with a small, shared quota; exhausting it must not turn a
+# correct solution into a nondeterministic reward-zero result. The root-owned
+# scratch directory is already removed by the EXIT trap.
+case_root="${scratch}/cases"
+install -d -o 0 -g 0 -m 0711 "${case_root}"
 "${scratch}/verifier" \
   "${binary_root}/traceweave" \
   "${binary_root}/tracegen" \
