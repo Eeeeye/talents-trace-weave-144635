@@ -33,6 +33,19 @@ fail() {
   exit 1
 }
 
+# The candidate runs as UID 10001. Terminate any process it left behind before
+# verifier assets are used, then ensure no such process survives this boundary.
+pkill -KILL -u 10001 2>/dev/null || true
+for _ in 1 2 3 4 5; do
+  if ! pgrep -u 10001 >/dev/null 2>&1; then
+    break
+  fi
+  /usr/bin/sleep 0.1
+done
+if pgrep -u 10001 >/dev/null 2>&1; then
+  fail "candidate-owned process survived the agent/verifier boundary"
+fi
+
 [[ -d "${workspace}" && ! -L "${workspace}" ]] || fail "workspace is missing or is a symlink"
 [[ -d /tests && ! -L /tests ]] || fail "verifier tests are missing or are a symlink"
 
@@ -70,7 +83,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="cd233c030c70e595db1282ebe5f10d74b8908aae71c3c0c0debd769f34f74140"
+  ["Dockerfile"]="e602fa04ff36afe9b94c208898b3c87209876292a09abf7eb1ada779294e5228"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"

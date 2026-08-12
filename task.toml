@@ -24,9 +24,11 @@ resume-state observations rather than trusting the supplied inspector.
 
 [verifier]
 timeout_sec = 420.0
+user = "root"
 
 [agent]
 timeout_sec = 10800.0
+user = "traceweave"
 
 [environment]
 build_timeout_sec = 600.0

@@ -13,6 +13,8 @@ RUN test "$(go list -m all | sed '1d' | wc -l)" -eq 0 && \
     go test -buildvcs=false ./... && \
     make build && \
     command -v setpriv >/dev/null && \
-    rm -rf -- bin .incident-work .reference-work demo
+    rm -rf -- bin .incident-work .reference-work demo && \
+    useradd --uid 10001 --create-home --shell /bin/bash traceweave && \
+    chown -R 10001:10001 /workspace/trace-weave
 
 CMD ["/bin/bash"]
