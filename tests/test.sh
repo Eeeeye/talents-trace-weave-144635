@@ -124,13 +124,18 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 (( file_count <= 800 )) || fail "workspace contains too many files: ${file_count}"
 (( byte_count <= 30000000 )) || fail "workspace is unexpectedly large: ${byte_count} bytes"
 
-# Keep all transient build and fixture data on the container's writable
-# overlay. Grading workers may mount both /tmp and /logs with small independent
-# quotas: /tmp is shared scratch, while /logs is reserved for verifier
-# artifacts. Only reward.txt and the concise verifier log belong under /logs.
-# mktemp creates this root-owned directory before any candidate code is run.
-[[ -d /var/tmp && ! -L /var/tmp ]] || fail "/var/tmp is missing or is a symlink"
-scratch="$(mktemp -d /var/tmp/.traceweave-verifier.XXXXXX)"
+# Keep transient build executables and fixtures on the container's executable
+# writable overlay. Grading workers may mount /tmp and /var/tmp with noexec (or
+# small independent quotas), while /logs is reserved for verifier artifacts.
+# /opt comes from the image, is root-controlled, and cannot be prepared by the
+# candidate. Validate that trust boundary before mktemp creates the scratch
+# directory. Only reward.txt and the concise verifier log belong under /logs.
+scratch_parent="/opt"
+[[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || fail "scratch parent is missing or is a symlink"
+[[ "$(stat -c '%u:%g' "${scratch_parent}")" == "0:0" ]] || fail "scratch parent is not owned by root"
+scratch_parent_mode="$(stat -c '%a' "${scratch_parent}")"
+(( (8#${scratch_parent_mode} & 0022) == 0 )) || fail "scratch parent is group- or world-writable"
+scratch="$(mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXX")"
 chown 0:0 "${scratch}"
 # Candidate builds run below a dropped UID and must traverse this parent, but
 # cannot list it. Verifier sources remain separately protected at /tests.
