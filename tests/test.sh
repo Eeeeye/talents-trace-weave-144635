@@ -8,7 +8,16 @@ log_path="${verifier_root}/trace-weave-tests.log"
 scratch=""
 case_root=""
 
-mkdir -p /logs "${verifier_root}"
+if [[ -L /logs || ( -e /logs && ! -d /logs ) ]]; then
+  printf 'trace-weave verifier integrity failure: /logs is not a real directory\n' >&2
+  exit 1
+fi
+mkdir -p /logs
+if [[ -L "${verifier_root}" || ( -e "${verifier_root}" && ! -d "${verifier_root}" ) ]]; then
+  printf 'trace-weave verifier integrity failure: verifier output root is not a real directory\n' >&2
+  exit 1
+fi
+mkdir -p "${verifier_root}"
 chown 0:0 /logs "${verifier_root}"
 chmod 0755 /logs
 chmod 0755 "${verifier_root}"
