@@ -22,4 +22,4 @@ for relative in "${repaired[@]}"; do
 done
 
 cd "${workspace}"
-gofmt -w "${repaired[@]}"
+/usr/local/go/bin/gofmt -w "${repaired[@]}"

@@ -206,7 +206,7 @@ TMPDIR="${runtime_root}/tmp" \
 GOCACHE="${runtime_root}/go-cache" \
 GOMODCACHE="${runtime_root}/go-mod-cache" \
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOENV=off \
-  go build -trimpath -buildvcs=false -o "${scratch}/verifier" /tests/verifier.go
+  /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${scratch}/verifier" /tests/verifier.go
 chown 0:0 "${scratch}/verifier"
 chmod 0500 "${scratch}/verifier"
 
