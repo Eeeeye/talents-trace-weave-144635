@@ -51,23 +51,23 @@ printf '0\n' >"${reward_path}"
 trap finish EXIT
 exec > >(tee -a "${log_path}") 2>&1
 
-# The candidate runs as UID 1000. Terminate any process it left behind before
-# verifier assets are used, then ensure no such process survives this boundary.
-pkill -KILL -u 1000 2>/dev/null || true
-for _ in 1 2 3 4 5; do
-  if ! pgrep -u 1000 >/dev/null 2>&1; then
-    break
-  fi
-  /usr/bin/sleep 0.1
-done
-if pgrep -u 1000 >/dev/null 2>&1; then
-  fail "candidate-owned process survived the agent/verifier boundary"
-fi
-
 [[ -d "${workspace}" && ! -L "${workspace}" ]] || fail "workspace is missing or is a symlink"
 [[ -d /tests && ! -L /tests ]] || fail "verifier tests are missing or are a symlink"
 [[ -f /tests/verifier && ! -L /tests/verifier ]] || fail "trusted verifier binary is missing or is not regular"
 [[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
+
+# Protect trusted assets before inspecting anything supplied by the candidate.
+# Some grading backends mount /tests read-only, so permission tightening is
+# deliberately best-effort; the verifier digest below remains authoritative.
+chown -R 0:0 /tests >/dev/null 2>&1 || true
+chmod -R u=rwX,go= /tests >/dev/null 2>&1 || true
+
+# Do not signal every process with the candidate UID. Remote workers may use
+# that UID for a session proxy or artifact collector outside the candidate's
+# process tree. Revoke future writes to the submitted tree; all compilation and
+# candidate execution below uses a separate root-owned snapshot.
+chown -R 0:0 "${workspace}" || fail "cannot take ownership of the candidate workspace"
+chmod -R a-w "${workspace}" || fail "cannot freeze the candidate workspace"
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -139,7 +139,7 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 # or that /logs has enough quota for build artifacts. Probe several
 # root-controlled parents and use the first one that is writable, executable,
 # and has enough free space for a cold Go cache. mktemp creates the name
-# atomically after all candidate-owned processes have been killed.
+# atomically after trusted assets are protected and the submitted tree frozen.
 workspace_parent="$(dirname -- "${workspace}")"
 for scratch_parent in /opt "${workspace_parent}" /var/tmp /tmp "${verifier_root}"; do
   [[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || continue
@@ -217,12 +217,6 @@ install -d -o 65532 -g 65532 -m 0700 \
   "${runtime_root}/home" "${runtime_root}/tmp"
 chown -R 65532:65532 "${runtime_root}/go-cache"
 chown -R 65532:65532 "${runtime_root}/go-mod-cache"
-
-# The verifier is already copied into root-controlled scratch. Hiding the
-# original test assets is defense in depth only; some backends mount /tests
-# read-only, so permission tightening must be best-effort.
-chown -R 0:0 /tests >/dev/null 2>&1 || true
-chmod -R u=rwX,go= /tests >/dev/null 2>&1 || true
 
 run_as_builder() {
   /usr/bin/setpriv \
