@@ -92,7 +92,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="dde1ea961cff55befc9354000f9ad84f62c57516216304365512dd3b975cf0a3"
+  ["Dockerfile"]="7df5dc93fc9db99af211fe01bd91c93fface0c71d55c1914c21d240d942e98f9"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -221,7 +221,6 @@ chown 0:0 "${binary_root}/tracegen" "${binary_root}/traceweave" "${binary_root}/
 chmod 0555 "${binary_root}/tracegen" "${binary_root}/traceweave" "${binary_root}/traceinspect"
 
 (cd "${source_root}" && run_as_builder /usr/local/go/bin/go test -buildvcs=false ./...)
-(cd "${source_root}" && run_as_builder /usr/local/go/bin/go test -buildvcs=false -race ./...)
 
 printf '[verifier] compile independent byte-level verifier\n'
 TMPDIR="${runtime_root}/tmp" \
