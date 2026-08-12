@@ -1,0 +1,6 @@
+/bin/
+/.incident-work/
+/.reference-work/
+/demo/
+*.out
+*.test

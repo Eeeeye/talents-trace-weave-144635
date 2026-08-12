@@ -1,0 +1,10 @@
+{
+  "manifest": "input/manifest.json",
+  "output": "merged.twseg",
+  "checkpoint": "merged.checkpoint.json",
+  "checkpoint_every_records": 10,
+  "read_chunk_bytes": 0,
+  "channel_capacity": 16,
+  "output_buffer_bytes": 65536,
+  "max_payload_bytes": 1048576
+}

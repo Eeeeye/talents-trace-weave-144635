@@ -1,0 +1,57 @@
+schema_version = "1.1"
+
+[task]
+name = "talents/trace-weave-resumable-merge"
+description = "Repair deterministic multi-rank trace merging and durable crash recovery in an offline Go HPC post-processor."
+authors = []
+keywords = ["go", "hpc", "concurrency", "binary-format", "checkpoint", "crash-recovery"]
+
+[metadata]
+difficulty = "hard"
+category = "systems"
+tags = ["debugging", "distributed-systems", "streaming", "durability", "offline"]
+expert_time_estimate_min = 210.0
+junior_time_estimate_min = 480.0
+difficulty_explanation = """
+The buildable starter exposes four interacting failures across stream framing,
+distributed identity, concurrent global ordering, and the durability boundary
+between buffered output and restart state. A repair must preserve strict binary
+and JSON contracts while coordinating five packages. Local fixes commonly mask
+one symptom while leaving loss, reordering, or crash recovery incorrect. The
+verifier uses independent decoding, varied hidden inputs, crash injection, and
+resume-state observations rather than trusting the supplied inspector.
+"""
+
+[verifier]
+timeout_sec = 420.0
+
+[agent]
+timeout_sec = 10800.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+gpus = 0
+allow_internet = false
+mcp_servers = []
+workdir = "/workspace/trace-weave"
+
+[environment.env]
+GOPROXY = "off"
+GOSUMDB = "off"
+GOTOOLCHAIN = "local"
+GOFLAGS = "-mod=readonly"
+
+[verifier.env]
+GOPROXY = "off"
+GOSUMDB = "off"
+GOTOOLCHAIN = "local"
+GOFLAGS = "-mod=readonly"
+
+[solution.env]
+GOPROXY = "off"
+GOSUMDB = "off"
+GOTOOLCHAIN = "local"
+GOFLAGS = "-mod=readonly"
