@@ -1,12 +1,45 @@
 #!/bin/bash
 set -Eeuo pipefail
 
+umask 077
+
 workspace="${TRACE_WEAVE_WORKSPACE:-/workspace/trace-weave}"
 verifier_root="/logs/verifier"
 reward_path="${verifier_root}/reward.txt"
 log_path="${verifier_root}/trace-weave-tests.log"
+reward=0
 scratch=""
-case_root=""
+unit_group_pid=""
+
+cleanup_unit_group() {
+  if [[ -n "${unit_group_pid}" ]]; then
+    kill -KILL -- "-${unit_group_pid}" >/dev/null 2>&1 || true
+    wait "${unit_group_pid}" >/dev/null 2>&1 || true
+    unit_group_pid=""
+  fi
+}
+
+cleanup() {
+  cleanup_unit_group
+  if [[ -n "${scratch}" && "${scratch}" == */.traceweave-verifier.* && -d "${scratch}" && ! -L "${scratch}" ]]; then
+    rm -rf -- "${scratch}"
+  fi
+}
+
+finish() {
+  status=$?
+  trap - EXIT
+  set +e
+  cleanup
+  printf '%s\n' "${reward}" >"${reward_path}"
+  chmod 0644 "${reward_path}"
+  exit "${status}"
+}
+
+fail() {
+  printf 'trace-weave verifier integrity failure: %s\n' "$1" >&2
+  exit 1
+}
 
 if [[ -L /logs || ( -e /logs && ! -d /logs ) ]]; then
   printf 'trace-weave verifier integrity failure: /logs is not a real directory\n' >&2
@@ -18,29 +51,15 @@ if [[ -L "${verifier_root}" || ( -e "${verifier_root}" && ! -d "${verifier_root}
   exit 1
 fi
 mkdir -p "${verifier_root}"
-chown 0:0 /logs "${verifier_root}"
+chown 0:0 /logs "${verifier_root}" >/dev/null 2>&1 || true
 chmod 0755 /logs
 chmod 0755 "${verifier_root}"
 rm -f -- "${reward_path}" "${log_path}"
 install -o 0 -g 0 -m 0644 /dev/null "${reward_path}"
 install -o 0 -g 0 -m 0644 /dev/null "${log_path}"
 printf '0\n' >"${reward_path}"
+trap finish EXIT
 exec > >(tee -a "${log_path}") 2>&1
-
-cleanup() {
-  if [[ -n "${case_root}" && -d "${case_root}" ]]; then
-    rm -rf -- "${case_root}"
-  fi
-  if [[ -n "${scratch}" && -d "${scratch}" ]]; then
-    rm -rf -- "${scratch}"
-  fi
-}
-trap cleanup EXIT
-
-fail() {
-  printf 'trace-weave verifier integrity failure: %s\n' "$1" >&2
-  exit 1
-}
 
 # The candidate runs as UID 1000. Terminate any process it left behind before
 # verifier assets are used, then ensure no such process survives this boundary.
@@ -57,6 +76,7 @@ fi
 
 [[ -d "${workspace}" && ! -L "${workspace}" ]] || fail "workspace is missing or is a symlink"
 [[ -d /tests && ! -L /tests ]] || fail "verifier tests are missing or are a symlink"
+[[ -f /tests/verifier.go && ! -L /tests/verifier.go ]] || fail "trusted verifier source is missing or is not regular"
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -124,27 +144,91 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 (( file_count <= 800 )) || fail "workspace contains too many files: ${file_count}"
 (( byte_count <= 30000000 )) || fail "workspace is unexpectedly large: ${byte_count} bytes"
 
-# Keep transient build executables and fixtures on the container's executable
-# writable overlay. Grading workers may mount /tmp and /var/tmp with noexec (or
-# small independent quotas), while /logs is reserved for verifier artifacts.
-# /opt comes from the image, is root-controlled, and cannot be prepared by the
-# candidate. Validate that trust boundary before mktemp creates the scratch
-# directory. Only reward.txt and the concise verifier log belong under /logs.
-scratch_parent="/opt"
-[[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || fail "scratch parent is missing or is a symlink"
-[[ "$(stat -c '%u:%g' "${scratch_parent}")" == "0:0" ]] || fail "scratch parent is not owned by root"
-scratch_parent_mode="$(stat -c '%a' "${scratch_parent}")"
-(( (8#${scratch_parent_mode} & 0022) == 0 )) || fail "scratch parent is group- or world-writable"
-scratch="$(mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXX")"
-chown 0:0 "${scratch}"
-# Candidate builds run below a dropped UID and must traverse this parent, but
-# cannot list it. Verifier sources remain separately protected at /tests.
+# Remote workers do not promise that /opt is writable, that /tmp is executable,
+# or that /logs has enough quota for build artifacts. Probe several
+# root-controlled parents and use the first one that is writable, executable,
+# and has enough free space for a cold Go cache. mktemp creates the name
+# atomically after all candidate-owned processes have been killed.
+workspace_parent="$(dirname -- "${workspace}")"
+for scratch_parent in /opt "${workspace_parent}" /var/tmp /tmp "${verifier_root}"; do
+  [[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || continue
+  [[ "$(stat -c '%u' "${scratch_parent}" 2>/dev/null || true)" == "0" ]] || continue
+  scratch_parent_mode="$(stat -c '%a' "${scratch_parent}" 2>/dev/null || true)"
+  [[ "${scratch_parent_mode}" =~ ^[0-7]+$ ]] || continue
+  # A writable parent is safe only when outsiders cannot rename entries, or
+  # when the sticky bit gives root-owned entries that protection (as on /tmp).
+  if (( (8#${scratch_parent_mode} & 0022) != 0 && (8#${scratch_parent_mode} & 01000) == 0 )); then
+    continue
+  fi
+
+  candidate_scratch=""
+  if ! candidate_scratch="$(mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXXXXXXXX" 2>/dev/null)"; then
+    continue
+  fi
+  if ! chown 0:0 "${candidate_scratch}" || ! chmod 0700 "${candidate_scratch}"; then
+    rmdir -- "${candidate_scratch}" >/dev/null 2>&1 || true
+    continue
+  fi
+
+  free_kib="$(df -Pk -- "${candidate_scratch}" 2>/dev/null | awk 'NR == 2 {print $4}')"
+  if [[ ! "${free_kib}" =~ ^[0-9]+$ ]] || (( free_kib < 131072 )); then
+    rmdir -- "${candidate_scratch}" >/dev/null 2>&1 || true
+    continue
+  fi
+
+  exec_probe="${candidate_scratch}/.exec-probe"
+  if ! install -o 0 -g 0 -m 0500 /bin/true "${exec_probe}" 2>/dev/null || ! "${exec_probe}"; then
+    rm -f -- "${exec_probe}" >/dev/null 2>&1 || true
+    rmdir -- "${candidate_scratch}" >/dev/null 2>&1 || true
+    continue
+  fi
+  rm -f -- "${exec_probe}"
+  scratch="${candidate_scratch}"
+  break
+done
+
+[[ -n "${scratch}" ]] || fail "no writable executable scratch filesystem with at least 128 MiB free"
+printf '[verifier] scratch parent: %s\n' "$(dirname -- "${scratch}")"
+# Candidate builds and commands run below a dropped UID and must traverse this
+# directory, but cannot list or modify it.
 chmod 0711 "${scratch}"
 source_root="${scratch}/source"
 binary_root="${scratch}/binaries"
 runtime_root="${scratch}/runtime"
+trusted_root="${scratch}/trusted"
 install -d -o 0 -g 0 -m 0755 "${source_root}"
-install -d -o 65532 -g 65532 -m 0700 "${binary_root}" "${runtime_root}"
+install -d -o 65532 -g 65532 -m 0700 "${binary_root}"
+install -d -o 0 -g 0 -m 0711 "${runtime_root}"
+install -d -o 0 -g 0 -m 0700 \
+  "${trusted_root}" "${runtime_root}/trusted-home" "${runtime_root}/trusted-tmp" \
+  "${runtime_root}/go-cache" "${runtime_root}/go-mod-cache"
+
+# Copy and compile the trusted verifier before touching candidate-derived build
+# commands. The source mount may be read-only, so it is never chmod'ed or
+# chown'ed as a prerequisite. A fresh cache removes any dependency on
+# /root/.cache/go-build; compiling the verifier also warms the standard-library
+# entries reused by the restricted candidate build.
+install -o 0 -g 0 -m 0600 /tests/verifier.go "${trusted_root}/verifier.go"
+(
+  cd "${trusted_root}"
+  /usr/bin/env -i \
+    HOME="${runtime_root}/trusted-home" \
+    PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TMPDIR="${runtime_root}/trusted-tmp" \
+    GOPROXY=off \
+    GOSUMDB=off \
+    GOTOOLCHAIN=local \
+    GOFLAGS=-mod=readonly \
+    GOENV=off \
+    CGO_ENABLED=0 \
+    GOCACHE="${runtime_root}/go-cache" \
+    GOMODCACHE="${runtime_root}/go-mod-cache" \
+    /usr/bin/timeout --signal=KILL 180s \
+      /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${scratch}/verifier" "${trusted_root}/verifier.go"
+)
+chown 0:0 "${scratch}/verifier"
+chmod 0500 "${scratch}/verifier"
+rm -f -- "${trusted_root}/verifier.go"
 
 tar \
   --exclude='./.git' \
@@ -158,30 +242,15 @@ find "${source_root}" -type d -exec chmod 0755 {} +
 find "${source_root}" -type f -exec chmod 0644 {} +
 
 install -d -o 65532 -g 65532 -m 0700 \
-  "${runtime_root}/home" "${runtime_root}/tmp" "${runtime_root}/go-cache" "${runtime_root}/go-mod-cache"
-
-# Reuse only the image-build cache behind root's non-traversable home. The
-# agent runs as UID 1000 and cannot read or modify this cache; Go's content
-# hashes still force every changed candidate package to compile. Copying it to
-# the disposable builder-owned cache avoids recompiling the Go standard
-# library on every verifier run, which matters on CPU-throttled workers.
-image_go_cache="/root/.cache/go-build"
-[[ -d /root && ! -L /root ]] || fail "root home is missing or is a symlink"
-[[ "$(stat -c '%u:%g' /root)" == "0:0" ]] || fail "root home is not owned by root"
-root_mode="$(stat -c '%a' /root)"
-(( (8#${root_mode} & 0077) == 0 )) || fail "root home is accessible outside root"
-[[ -d "${image_go_cache}" && ! -L "${image_go_cache}" ]] || fail "trusted image Go cache is missing or is a symlink"
-if find "${image_go_cache}" -xdev \( ! -user root -o -perm /0022 -o -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q .; then
-  fail "trusted image Go cache has unsafe ownership, permissions, or file types"
-fi
-cp -a -- "${image_go_cache}/." "${runtime_root}/go-cache/"
+  "${runtime_root}/home" "${runtime_root}/tmp"
 chown -R 65532:65532 "${runtime_root}/go-cache"
+chown -R 65532:65532 "${runtime_root}/go-mod-cache"
 
-# Hide verifier sources before running any command derived from the candidate
-# tree, including module inspection and compilation.
-chown -R 0:0 /tests
-find /tests -type d -exec chmod 0700 {} +
-find /tests -type f -exec chmod 0600 {} +
+# The verifier is already compiled and runs before candidate unit tests. Hiding
+# its original source is defense in depth only; some backends mount /tests
+# read-only, so permission tightening must be best-effort.
+chown -R 0:0 /tests >/dev/null 2>&1 || true
+chmod -R u=rwX,go= /tests >/dev/null 2>&1 || true
 
 run_as_builder() {
   /usr/bin/setpriv \
@@ -203,6 +272,7 @@ run_as_builder() {
       GOTOOLCHAIN=local \
       GOFLAGS=-mod=readonly \
       GOENV=off \
+      CGO_ENABLED=0 \
       GOCACHE="${runtime_root}/go-cache" \
       GOMODCACHE="${runtime_root}/go-mod-cache" \
       /usr/bin/timeout --signal=KILL 120s "$@"
@@ -219,28 +289,61 @@ for command in tracegen traceweave traceinspect; do
 done
 chown 0:0 "${binary_root}/tracegen" "${binary_root}/traceweave" "${binary_root}/traceinspect"
 chmod 0555 "${binary_root}/tracegen" "${binary_root}/traceweave" "${binary_root}/traceinspect"
-
-(cd "${source_root}" && run_as_builder /usr/local/go/bin/go test -buildvcs=false ./...)
-
-printf '[verifier] compile independent byte-level verifier\n'
-TMPDIR="${runtime_root}/tmp" \
-GOCACHE="${runtime_root}/go-cache" \
-GOMODCACHE="${runtime_root}/go-mod-cache" \
-GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOENV=off \
-  /usr/local/go/bin/go build -trimpath -buildvcs=false -o "${scratch}/verifier" /tests/verifier.go
-chown 0:0 "${scratch}/verifier"
-chmod 0500 "${scratch}/verifier"
+chown 0:0 "${binary_root}"
+chmod 0511 "${binary_root}"
 
 # Keep generated fixtures in the same root-controlled overlay scratch. They
 # must not consume either the shared /tmp quota or the /logs artifact quota.
 # The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
 install -d -o 0 -g 0 -m 0711 "${case_root}"
+printf '[verifier] independent byte-level integration checks\n'
 "${scratch}/verifier" \
   "${binary_root}/traceweave" \
   "${binary_root}/tracegen" \
   "${binary_root}/traceinspect" \
   "${case_root}"
 
-printf '1\n' >"${reward_path}"
+# Candidate unit tests are fixed protected files, but they are still executable
+# candidate-tree code. Run them only after the independent checks and in their
+# own process group so no descendant can survive the verifier boundary.
+printf '[verifier] protected candidate unit tests\n'
+unit_log="${scratch}/unit-tests.log"
+set +e
+(
+  cd "${source_root}"
+  exec /usr/bin/setsid /usr/bin/setpriv \
+    --reuid=65532 \
+    --regid=65532 \
+    --clear-groups \
+    --no-new-privs \
+    --bounding-set=-all \
+    --inh-caps=-all \
+    --ambient-caps=-all \
+    /usr/bin/env -i \
+      HOME="${runtime_root}/home" \
+      USER=traceweave-builder \
+      LOGNAME=traceweave-builder \
+      PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      TMPDIR="${runtime_root}/tmp" \
+      GOPROXY=off \
+      GOSUMDB=off \
+      GOTOOLCHAIN=local \
+      GOFLAGS=-mod=readonly \
+      GOENV=off \
+      CGO_ENABLED=0 \
+      GOCACHE="${runtime_root}/go-cache" \
+      GOMODCACHE="${runtime_root}/go-mod-cache" \
+      /usr/bin/timeout --signal=KILL 120s \
+        /usr/local/go/bin/go test -buildvcs=false -count=1 ./...
+) >"${unit_log}" 2>&1 &
+unit_group_pid=$!
+wait "${unit_group_pid}"
+unit_status=$?
+set -e
+cleanup_unit_group
+cat "${unit_log}"
+(( unit_status == 0 )) || exit "${unit_status}"
+
+reward=1
 printf '[verifier] reward=1\n'
