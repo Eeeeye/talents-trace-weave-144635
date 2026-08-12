@@ -36,6 +36,37 @@ fail() {
 [[ -d "${workspace}" && ! -L "${workspace}" ]] || fail "workspace is missing or is a symlink"
 [[ -d /tests && ! -L /tests ]] || fail "verifier tests are missing or are a symlink"
 
+while IFS= read -r -d '' entry; do
+  name="$(basename -- "${entry}")"
+  case "${name}" in
+    .dockerignore|.gitignore|Dockerfile|LICENSE|Makefile|README.md|bin|cmd|configs|go.mod|internal|scripts)
+      ;;
+    *)
+      fail "path outside the allowed edit surface: ${name}"
+      ;;
+  esac
+done < <(find "${workspace}" -mindepth 1 -maxdepth 1 -print0)
+
+if [[ -e "${workspace}/go.sum" ]]; then
+  fail "go.sum is outside the allowed edit surface"
+fi
+while IFS= read -r -d '' test_path; do
+  relative="${test_path#"${workspace}/"}"
+  case "${relative}" in
+    internal/checkpoint/checkpoint_test.go|\
+    internal/config/config_test.go|\
+    internal/format/format_test.go|\
+    internal/generator/generator_test.go|\
+    internal/manifest/manifest_test.go|\
+    internal/model/model_test.go|\
+    internal/runner/runner_test.go)
+      ;;
+    *)
+      fail "new or relocated Go test is outside the allowed edit surface: ${relative}"
+      ;;
+  esac
+done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
+
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
