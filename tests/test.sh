@@ -112,7 +112,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="7df5dc93fc9db99af211fe01bd91c93fface0c71d55c1914c21d240d942e98f9"
+  ["Dockerfile"]="92f85d3f11a38945f146c666baa4a24ae40d1d6df274f359e79551a084af7a1b"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -203,11 +203,25 @@ install -d -o 0 -g 0 -m 0700 \
   "${trusted_root}" "${runtime_root}/trusted-home" "${runtime_root}/trusted-tmp" \
   "${runtime_root}/go-cache" "${runtime_root}/go-mod-cache"
 
+# Copy the standard-library and fixed-starter cache prepared while the image
+# was built. It lives outside /root so worker runtimes may replace the root
+# home without losing it. The image path is never candidate-writable; Go's
+# action hashes still rebuild every package whose source or flags changed.
+image_go_cache="/usr/local/share/traceweave-go-cache"
+[[ -d "${image_go_cache}" && ! -L "${image_go_cache}" ]] || fail "trusted image Go cache is missing or is a symlink"
+[[ "$(stat -c '%u:%g' "${image_go_cache}")" == "0:0" ]] || fail "trusted image Go cache is not owned by root"
+image_go_cache_mode="$(stat -c '%a' "${image_go_cache}")"
+[[ "${image_go_cache_mode}" =~ ^[0-7]+$ ]] || fail "trusted image Go cache has an invalid mode"
+(( (8#${image_go_cache_mode} & 0077) == 0 )) || fail "trusted image Go cache is accessible outside root"
+if find "${image_go_cache}" -xdev \( ! -user root -o -perm /0022 -o -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q .; then
+  fail "trusted image Go cache has unsafe ownership, permissions, or file types"
+fi
+cp -a -- "${image_go_cache}/." "${runtime_root}/go-cache/"
+
 # Copy and compile the trusted verifier before touching candidate-derived build
 # commands. The source mount may be read-only, so it is never chmod'ed or
-# chown'ed as a prerequisite. A fresh cache removes any dependency on
-# /root/.cache/go-build; compiling the verifier also warms the standard-library
-# entries reused by the restricted candidate build.
+# chown'ed as a prerequisite. Compiling it also populates any cache entries not
+# already covered by the image build before ownership is dropped.
 install -o 0 -g 0 -m 0600 /tests/verifier.go "${trusted_root}/verifier.go"
 (
   cd "${trusted_root}"
