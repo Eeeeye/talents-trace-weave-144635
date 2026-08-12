@@ -201,10 +201,11 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
 chown 0:0 "${scratch}/verifier"
 chmod 0500 "${scratch}/verifier"
 
-# Keep generated fixtures on the verifier artifact filesystem. Some grading
-# workers mount /tmp with a small, shared quota; exhausting it must not turn a
-# correct solution into a nondeterministic reward-zero result. The root-owned
-# scratch directory is already removed by the EXIT trap.
+# Keep generated fixtures on the verifier artifact filesystem.  Some grading
+# workers mount /tmp with a small, shared quota; an exhausted /tmp must not turn
+# a correct solution into a nondeterministic reward-zero result.  The scratch
+# directory already lives under /logs/verifier, is root controlled, and is
+# removed by the EXIT trap.
 case_root="${scratch}/cases"
 install -d -o 0 -g 0 -m 0711 "${case_root}"
 "${scratch}/verifier" \
