@@ -92,7 +92,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="7df5dc93fc9db99af211fe01bd91c93fface0c71d55c1914c21d240d942e98f9"
+  ["Dockerfile"]="dde1ea961cff55befc9354000f9ad84f62c57516216304365512dd3b975cf0a3"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -159,6 +159,23 @@ find "${source_root}" -type f -exec chmod 0644 {} +
 
 install -d -o 65532 -g 65532 -m 0700 \
   "${runtime_root}/home" "${runtime_root}/tmp" "${runtime_root}/go-cache" "${runtime_root}/go-mod-cache"
+
+# Reuse only the image-build cache behind root's non-traversable home. The
+# agent runs as UID 1000 and cannot read or modify this cache; Go's content
+# hashes still force every changed candidate package to compile. Copying it to
+# the disposable builder-owned cache avoids recompiling the Go standard
+# library on every verifier run, which matters on CPU-throttled workers.
+image_go_cache="/root/.cache/go-build"
+[[ -d /root && ! -L /root ]] || fail "root home is missing or is a symlink"
+[[ "$(stat -c '%u:%g' /root)" == "0:0" ]] || fail "root home is not owned by root"
+root_mode="$(stat -c '%a' /root)"
+(( (8#${root_mode} & 0077) == 0 )) || fail "root home is accessible outside root"
+[[ -d "${image_go_cache}" && ! -L "${image_go_cache}" ]] || fail "trusted image Go cache is missing or is a symlink"
+if find "${image_go_cache}" -xdev \( ! -user root -o -perm /0022 -o -type l -o -type b -o -type c -o -type p -o -type s \) -print -quit | grep -q .; then
+  fail "trusted image Go cache has unsafe ownership, permissions, or file types"
+fi
+cp -a -- "${image_go_cache}/." "${runtime_root}/go-cache/"
+chown -R 65532:65532 "${runtime_root}/go-cache"
 
 # Hide verifier sources before running any command derived from the candidate
 # tree, including module inspection and compilation.
