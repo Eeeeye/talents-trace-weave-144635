@@ -19,15 +19,70 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
-	candidateUID     = 1001
-	candidateGID     = 1001
-	spoolHeaderSize  = 40
-	recordHeaderSize = 40
-	segmentHeadSize  = 56
+	candidateUID         = 1001
+	candidateGID         = 1001
+	spoolHeaderSize      = 40
+	recordHeaderSize     = 40
+	segmentHeadSize      = 56
+	landlockCreate       = 444
+	landlockAddRule      = 445
+	landlockRestrict     = 446
+	landlockRulePath     = 1
+	prSetNoNewPrivs      = 38
+	prSetSecurebits      = 28
+	prCapAmbient         = 47
+	prCapAmbientClearAll = 4
+	linuxCapVersion3     = 0x20080522
 )
+
+const (
+	fsExecute uint64 = 1 << iota
+	fsWriteFile
+	fsReadFile
+	fsReadDir
+	fsRemoveDir
+	fsRemoveFile
+	fsMakeChar
+	fsMakeDir
+	fsMakeReg
+	fsMakeSock
+	fsMakeFIFO
+	fsMakeBlock
+	fsMakeSymlink
+	fsRefer
+	fsTruncate
+)
+
+const fsHandled = fsExecute | fsWriteFile | fsReadFile | fsReadDir | fsRemoveDir | fsRemoveFile |
+	fsMakeChar | fsMakeDir | fsMakeReg | fsMakeSock | fsMakeFIFO | fsMakeBlock | fsMakeSymlink |
+	fsRefer | fsTruncate
+
+const fsReadOnly = fsExecute | fsReadFile | fsReadDir
+const fsReadWrite = fsHandled &^ (fsMakeBlock | fsMakeChar)
+
+type landlockRulesetAttr struct {
+	HandledAccessFS uint64
+}
+
+type landlockPathBeneathAttr struct {
+	AllowedAccess uint64
+	ParentFD      int32
+}
+
+type linuxCapHeader struct {
+	Version uint32
+	PID     int32
+}
+
+type linuxCapData struct {
+	Effective   uint32
+	Permitted   uint32
+	Inheritable uint32
+}
 
 type event struct {
 	Epoch     uint64
@@ -137,6 +192,9 @@ func main() {
 	if err := os.MkdirAll(caseRoot, 0o711); err != nil {
 		fatal(err)
 	}
+	if err := restrictFilesystem(traceweave, tracegen, traceinspect, caseRoot); err != nil {
+		fatal(fmt.Errorf("sandbox setup: %w", err))
+	}
 
 	tests := []struct {
 		name string
@@ -156,6 +214,114 @@ func main() {
 		}
 	}
 	fmt.Println("[verifier] all independent checks passed")
+}
+
+func restrictFilesystem(traceweave, tracegen, traceinspect, caseRoot string) error {
+	version, _, errno := syscall.Syscall(landlockCreate, 0, 0, 1)
+	if errno != 0 {
+		return fmt.Errorf("landlock ABI query: %w", errno)
+	}
+	if version < 1 {
+		return fmt.Errorf("landlock ABI %d is older than required ABI 1", version)
+	}
+	handled := fsHandled
+	if version < 2 {
+		handled &^= fsRefer
+	}
+	if version < 3 {
+		handled &^= fsTruncate
+	}
+	rulesetAttr := landlockRulesetAttr{HandledAccessFS: handled}
+	rulesetFD, _, errno := syscall.Syscall(landlockCreate,
+		uintptr(unsafe.Pointer(&rulesetAttr)), unsafe.Sizeof(rulesetAttr), 0)
+	if errno != 0 {
+		return fmt.Errorf("landlock ruleset creation: %w", errno)
+	}
+	defer syscall.Close(int(rulesetFD))
+
+	readOnly := []string{
+		filepath.Dir(traceweave),
+	}
+	for _, path := range readOnly {
+		if err := addLandlockPath(int(rulesetFD), path, fsReadOnly); err != nil {
+			if errors.Is(err, os.ErrNotExist) && path == "/usr/share/zoneinfo" {
+				continue
+			}
+			return err
+		}
+	}
+	if err := addLandlockPath(int(rulesetFD), "/dev/null", fsReadFile|fsWriteFile); err != nil {
+		return err
+	}
+	if err := addLandlockPath(int(rulesetFD), caseRoot, fsReadWrite&handled); err != nil {
+		return err
+	}
+	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); errno != 0 {
+		return fmt.Errorf("set no_new_privs: %w", errno)
+	}
+	if err := dropCapabilities(); err != nil {
+		return err
+	}
+	if _, _, errno := syscall.Syscall(landlockRestrict, rulesetFD, 0, 0); errno != 0 {
+		return fmt.Errorf("landlock restrict self: %w", errno)
+	}
+	if file, err := os.Open("/tests/verifier.go"); err == nil {
+		file.Close()
+		return errors.New("sandbox unexpectedly permits reading /tests")
+	} else if !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("sandbox /tests probe: %w", err)
+	}
+	if file, err := os.OpenFile("/logs/verifier/reward.txt", os.O_WRONLY, 0); err == nil {
+		file.Close()
+		return errors.New("sandbox unexpectedly permits writing /logs")
+	} else if !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("sandbox /logs probe: %w", err)
+	}
+	return nil
+}
+
+func dropCapabilities() error {
+	const secureNoRoot = 1 | 2 | 4 | 8
+	_, _, secureErrno := syscall.Syscall6(syscall.SYS_PRCTL, prSetSecurebits, secureNoRoot, 0, 0, 0, 0)
+	if secureErrno != 0 && secureErrno != syscall.EPERM {
+		return fmt.Errorf("set securebits: %w", secureErrno)
+	}
+	_, _, ambientErrno := syscall.Syscall6(syscall.SYS_PRCTL, prCapAmbient, prCapAmbientClearAll, 0, 0, 0, 0)
+	if ambientErrno != 0 && ambientErrno != syscall.EINVAL {
+		return fmt.Errorf("clear ambient capabilities: %w", ambientErrno)
+	}
+	header := linuxCapHeader{Version: linuxCapVersion3}
+	data := [2]linuxCapData{}
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_CAPSET,
+		uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data[0])), 0); errno != 0 {
+		return fmt.Errorf("drop process capabilities: %w", errno)
+	}
+	observed := [2]linuxCapData{}
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_CAPGET,
+		uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&observed[0])), 0); errno != 0 {
+		return fmt.Errorf("verify process capabilities: %w", errno)
+	}
+	for _, set := range observed {
+		if set.Effective != 0 || set.Permitted != 0 || set.Inheritable != 0 {
+			return errors.New("process capabilities remain after sandbox setup")
+		}
+	}
+	return nil
+}
+
+func addLandlockPath(rulesetFD int, path string, access uint64) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open sandbox path %s: %w", path, err)
+	}
+	defer file.Close()
+	attr := landlockPathBeneathAttr{AllowedAccess: access, ParentFD: int32(file.Fd())}
+	_, _, errno := syscall.Syscall6(landlockAddRule, uintptr(rulesetFD), landlockRulePath,
+		uintptr(unsafe.Pointer(&attr)), 0, 0, 0)
+	if errno != 0 {
+		return fmt.Errorf("add sandbox path %s: %w", path, errno)
+	}
+	return nil
 }
 
 func fatal(err error) {
@@ -1519,23 +1685,17 @@ func runCandidate(binary, workdir string, timeout time.Duration, arguments ...st
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return commandResult{}, err
 		}
-		if err := os.Chown(path, candidateUID, candidateGID); err != nil {
-			return commandResult{}, err
-		}
 	}
-	setprivArgs := []string{
-		"--reuid=" + strconv.Itoa(candidateUID), "--regid=" + strconv.Itoa(candidateGID),
-		"--clear-groups", "--no-new-privs",
-		"/usr/bin/env", "-i", "HOME=" + home, "USER=traceweave-candidate", "LOGNAME=traceweave-candidate",
+	candidateEnv := []string{
+		"HOME=" + home, "USER=traceweave-candidate", "LOGNAME=traceweave-candidate",
 		"PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"TMPDIR=" + temporary, "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly",
-		binary,
+		"TMPDIR=" + temporary, "TZ=UTC", "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly",
 	}
-	setprivArgs = append(setprivArgs, arguments...)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.Command("/usr/bin/setpriv", setprivArgs...)
+	cmd := exec.Command(binary, arguments...)
 	cmd.Dir = workdir
+	cmd.Env = candidateEnv
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -1650,7 +1810,7 @@ func chownTree(root string, uid, gid int) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("fixture unexpectedly contains symlink %s", path)
 		}
-		return os.Chown(path, uid, gid)
+		return nil
 	})
 }
 
