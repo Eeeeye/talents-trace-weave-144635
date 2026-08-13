@@ -60,9 +60,10 @@ exec > >(tee -a "${log_path}") 2>&1
 [[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
 
 # The verifier shell protects trusted assets, snapshots the submitted tree,
-# and compiles both programs. The semantic verifier then enters a Landlock
-# domain before it launches any candidate child. This works even when UID 0
-# has no capabilities and cannot chown files or switch process credentials.
+# and compiles both programs. Before launching candidate children, the
+# semantic verifier enters a Landlock domain when available. On workers that
+# block Landlock it instead seals a private chroot and permanently drops to
+# UID/GID 1000; if either safe isolation path is unavailable, grading fails.
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -98,7 +99,6 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="be015b111b86cc7cf69b9eef70aaa2908bd230af5ed7a5b9615d145e32ef627b"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -111,6 +111,29 @@ declare -A protected_hashes=(
   ["internal/model/model_test.go"]="eeebfe0f293e82ba349f41559bce40d5fce256c0ec5b2cee3b692ef14872239c"
   ["internal/runner/runner_test.go"]="4416e237f321710d1512f893966bc9922c8ba7d726394d07b1d9e0a0e7320e4c"
 )
+
+# Platform workers can reuse an image built from an earlier reviewed revision
+# even though /tests and /solution are mounted from the current task. Accept
+# only Dockerfiles that actually appeared in this activity's reviewed history;
+# arbitrary candidate edits remain outside the permitted edit surface.
+declare -A allowed_dockerfile_hashes=(
+  ["224ea3e3ca2a1976b205ceb652e7cb1fa3b3abf78802f00e8ee3e0849e9b79e4"]=1
+  ["4845a1ff569a614b77f8969adc19e19f9874d290f14538a4d14e6d115d0aa5aa"]=1
+  ["7df5dc93fc9db99af211fe01bd91c93fface0c71d55c1914c21d240d942e98f9"]=1
+  ["92f85d3f11a38945f146c666baa4a24ae40d1d6df274f359e79551a084af7a1b"]=1
+  ["be015b111b86cc7cf69b9eef70aaa2908bd230af5ed7a5b9615d145e32ef627b"]=1
+  ["cd233c030c70e595db1282ebe5f10d74b8908aae71c3c0c0debd769f34f74140"]=1
+  ["d227357e3705e20b16b423515c568e73cc600c895cf863a478d8582078692877"]=1
+  ["dde1ea961cff55befc9354000f9ad84f62c57516216304365512dd3b975cf0a3"]=1
+  ["df3cd96d39ebd3f770e1c4df7f3509d6b08bd9aca52222accc1bfe4b5ff0a099"]=1
+  ["e602fa04ff36afe9b94c208898b3c87209876292a09abf7eb1ada779294e5228"]=1
+  ["f2ac225fb589381d03492ae084d82ca102e93cdab9fc3825114c79c2f70ea790"]=1
+  ["f3fccba61717942eeb043375dd5cf2062637e54aa0f6a4e2917ecac8cd202d50"]=1
+)
+dockerfile_path="${workspace}/Dockerfile"
+[[ -f "${dockerfile_path}" && ! -L "${dockerfile_path}" ]] || fail "protected file is missing or not regular: Dockerfile"
+dockerfile_hash="$(sha256sum -- "${dockerfile_path}" | awk '{print $1}')"
+[[ -n "${allowed_dockerfile_hashes[${dockerfile_hash}]:-}" ]] || fail "protected file changed: Dockerfile"
 
 for relative in "${!protected_hashes[@]}"; do
   path="${workspace}/${relative}"
@@ -130,25 +153,37 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 (( file_count <= 800 )) || fail "workspace contains too many files: ${file_count}"
 (( byte_count <= 30000000 )) || fail "workspace is unexpectedly large: ${byte_count} bytes"
 
-scratch_parent="/var/lib/traceweave-verifier"
-[[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || fail "image verifier scratch root is missing or unsafe"
-[[ "$(stat -c '%u:%g:%a' "${scratch_parent}" 2>/dev/null || true)" == "0:0:700" ]] || fail "image verifier scratch root has unsafe ownership or mode"
-scratch="$(/usr/bin/mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXXXXXXXX")"
-[[ -n "${scratch}" && -d "${scratch}" && ! -L "${scratch}" ]] || fail "cannot create verifier scratch directory"
-chmod 0700 "${scratch}"
-free_kib="$(df -Pk -- "${scratch}" 2>/dev/null | awk 'NR == 2 {print $4}')"
-[[ "${free_kib}" =~ ^[0-9]+$ ]] && (( free_kib >= 131072 )) || fail "verifier scratch has less than 128 MiB free"
-exec_probe="${scratch}/.exec-probe"
-install -m 0500 /bin/true "${exec_probe}"
-"${exec_probe}" || fail "verifier scratch filesystem is mounted noexec"
-rm -f -- "${exec_probe}"
+for scratch_parent in /var/lib/traceweave-verifier /var/tmp /workspace /tmp; do
+  [[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || continue
+  candidate_scratch="$(/usr/bin/mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXXXXXXXX" 2>/dev/null || true)"
+  [[ -n "${candidate_scratch}" && -d "${candidate_scratch}" && ! -L "${candidate_scratch}" ]] || continue
+  chmod 0700 "${candidate_scratch}" || {
+    rmdir -- "${candidate_scratch}" >/dev/null 2>&1 || true
+    continue
+  }
+  free_kib="$(df -Pk -- "${candidate_scratch}" 2>/dev/null | awk 'NR == 2 {print $4}')"
+  if [[ ! "${free_kib}" =~ ^[0-9]+$ ]] || (( free_kib < 131072 )); then
+    rmdir -- "${candidate_scratch}" >/dev/null 2>&1 || true
+    continue
+  fi
+  exec_probe="${candidate_scratch}/.exec-probe"
+  if ! install -m 0500 /bin/true "${exec_probe}" 2>/dev/null || ! "${exec_probe}"; then
+    rm -f -- "${exec_probe}" >/dev/null 2>&1 || true
+    rmdir -- "${candidate_scratch}" >/dev/null 2>&1 || true
+    continue
+  fi
+  rm -f -- "${exec_probe}"
+  scratch="${candidate_scratch}"
+  break
+done
+[[ -n "${scratch}" ]] || fail "no writable executable scratch filesystem with at least 128 MiB free"
 printf '[verifier] scratch parent: %s\n' "$(dirname -- "${scratch}")"
 source_root="${scratch}/source"
 binary_root="${scratch}/binaries"
 trusted_runtime_root="${scratch}/trusted-runtime"
 trusted_root="${scratch}/trusted"
 install -d -m 0755 "${source_root}"
-install -d -m 0700 "${binary_root}"
+install -d -m 0711 "${binary_root}"
 install -d -m 0700 "${trusted_root}" "${trusted_runtime_root}"
 install -d -m 0700 \
   "${trusted_runtime_root}/home" "${trusted_runtime_root}/tmp" \
@@ -216,14 +251,18 @@ module_lines="$(cd "${source_root}" && /usr/local/go/bin/go list -m all | sed '1
 )
 for command in tracegen traceweave traceinspect; do
   [[ -f "${binary_root}/${command}" && ! -L "${binary_root}/${command}" ]] || fail "candidate build did not produce ${command}"
-  chmod 0500 "${binary_root}/${command}"
+  chmod 0555 "${binary_root}/${command}"
 done
+chmod 0711 "${scratch}" "${binary_root}"
 
 # Keep generated fixtures in the same root-controlled overlay scratch. They
 # must not consume either the shared /tmp quota or the /logs artifact quota.
 # The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
 install -d -m 0700 "${case_root}"
+chmod 0700 /tests 2>/dev/null || true
+chmod 0600 /tests/verifier.go /tests/verifier.sha256 2>/dev/null || true
+chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '[verifier] independent byte-level integration checks\n'
 /usr/bin/timeout --signal=KILL 360s \
   "${scratch}/verifier" \

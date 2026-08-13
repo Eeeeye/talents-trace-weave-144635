@@ -32,6 +32,7 @@ const (
 	landlockRestrict     = 446
 	landlockRulePath     = 1
 	prSetNoNewPrivs      = 38
+	prSetDumpable        = 4
 	prSetSecurebits      = 28
 	prCapAmbient         = 47
 	prCapAmbientClearAll = 4
@@ -197,9 +198,20 @@ func main() {
 		fatal(err)
 	}
 	if err := restrictFilesystem(traceweave, caseRoot); err != nil {
-		fatal(fmt.Errorf("sandbox setup: %w", err))
+		if !sandboxUnavailable(err) {
+			fatal(fmt.Errorf("sandbox setup: %w", err))
+		}
+		fallbackTraceweave, fallbackTracegen, fallbackTraceinspect, fallbackCaseRoot, fallbackErr :=
+			restrictFallback(traceweave, tracegen, traceinspect, caseRoot)
+		if fallbackErr != nil {
+			fatal(fmt.Errorf("sandbox fallback after %v: %w", err, fallbackErr))
+		}
+		traceweave, tracegen, traceinspect, caseRoot =
+			fallbackTraceweave, fallbackTracegen, fallbackTraceinspect, fallbackCaseRoot
+		fmt.Printf("[verifier] candidate isolation: sealed portable fallback (%v)\n", err)
+	} else {
+		fmt.Println("[verifier] candidate isolation: capability-free Landlock domain")
 	}
-	fmt.Println("[verifier] candidate isolation: capability-free Landlock domain")
 
 	tests := []struct {
 		name string
@@ -219,6 +231,127 @@ func main() {
 		}
 	}
 	fmt.Println("[verifier] all independent checks passed")
+}
+
+func sandboxUnavailable(err error) bool {
+	return errors.Is(err, syscall.ENOSYS) || errors.Is(err, syscall.EPERM) ||
+		errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, syscall.EOPNOTSUPP)
+}
+
+// restrictFallback is used on grading workers whose seccomp profile or kernel
+// does not expose Landlock. The semantic verifier has already been compiled
+// from digest-checked source before it reaches this function. Unlink this
+// executable, chroot into the root-owned scratch tree, make the verifier
+// non-dumpable, and permanently drop to an unprivileged identity before any
+// candidate process starts. The read-only /tests mount and writable /logs
+// mount are both outside the chroot, while candidate output remains checked
+// by the in-memory randomized oracle.
+func restrictFallback(traceweave, tracegen, traceinspect, caseRoot string) (string, string, string, string, error) {
+	const candidateID = 1000
+	if os.Geteuid() != 0 {
+		return "", "", "", "", fmt.Errorf("portable fallback requires root before privilege drop (euid=%d)", os.Geteuid())
+	}
+	chrootRoot := filepath.Dir(caseRoot)
+	rootInfo, err := os.Lstat(chrootRoot)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("inspect fallback root: %w", err)
+	}
+	rootStat, ok := rootInfo.Sys().(*syscall.Stat_t)
+	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || !ok || rootStat.Uid != 0 {
+		return "", "", "", "", errors.New("fallback root is not a root-owned real directory")
+	}
+	mapPath := func(path string) (string, error) {
+		relative, err := filepath.Rel(chrootRoot, path)
+		if err != nil {
+			return "", err
+		}
+		if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("path %s escapes fallback root", path)
+		}
+		return string(filepath.Separator) + relative, nil
+	}
+	fallbackTraceweave, err := mapPath(traceweave)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("map traceweave into fallback root: %w", err)
+	}
+	fallbackTracegen, err := mapPath(tracegen)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("map tracegen into fallback root: %w", err)
+	}
+	fallbackTraceinspect, err := mapPath(traceinspect)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("map traceinspect into fallback root: %w", err)
+	}
+	fallbackCaseRoot, err := mapPath(caseRoot)
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("map case root into fallback root: %w", err)
+	}
+	if err := os.Chown(caseRoot, candidateID, candidateID); err != nil {
+		return "", "", "", "", fmt.Errorf("transfer case root ownership: %w", err)
+	}
+	if info, err := os.Stat(caseRoot); err != nil {
+		return "", "", "", "", fmt.Errorf("verify case root ownership: %w", err)
+	} else if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Uid != candidateID || stat.Gid != candidateID {
+		return "", "", "", "", errors.New("case root ownership did not transfer to fallback user")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", "", "", "", fmt.Errorf("resolve verifier executable: %w", err)
+	}
+	if err := os.Remove(executable); err != nil {
+		return "", "", "", "", fmt.Errorf("unlink verifier executable: %w", err)
+	}
+	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); errno != 0 {
+		return "", "", "", "", fmt.Errorf("set no_new_privs: %w", errno)
+	}
+	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0); errno != 0 {
+		return "", "", "", "", fmt.Errorf("disable verifier dumpability: %w", errno)
+	}
+	if err := syscall.Chroot(chrootRoot); err != nil {
+		return "", "", "", "", fmt.Errorf("enter fallback chroot: %w", err)
+	}
+	if err := os.Chdir(string(filepath.Separator)); err != nil {
+		return "", "", "", "", fmt.Errorf("enter fallback root directory: %w", err)
+	}
+	if err := syscall.Setgroups([]int{}); err != nil {
+		return "", "", "", "", fmt.Errorf("clear supplementary groups: %w", err)
+	}
+	if err := syscall.Setgid(candidateID); err != nil {
+		return "", "", "", "", fmt.Errorf("drop fallback gid: %w", err)
+	}
+	if err := syscall.Setuid(candidateID); err != nil {
+		return "", "", "", "", fmt.Errorf("drop fallback uid: %w", err)
+	}
+	if os.Getuid() != candidateID || os.Geteuid() != candidateID ||
+		os.Getgid() != candidateID || os.Getegid() != candidateID {
+		return "", "", "", "", fmt.Errorf("fallback credentials remain uid=%d euid=%d gid=%d egid=%d",
+			os.Getuid(), os.Geteuid(), os.Getgid(), os.Getegid())
+	}
+	if groups, err := os.Getgroups(); err != nil {
+		return "", "", "", "", fmt.Errorf("verify supplementary groups: %w", err)
+	} else if len(groups) != 0 {
+		return "", "", "", "", fmt.Errorf("supplementary groups remain after fallback drop: %v", groups)
+	}
+	if err := dropCapabilities(); err != nil {
+		return "", "", "", "", err
+	}
+	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0); errno != 0 {
+		return "", "", "", "", fmt.Errorf("restore non-dumpable state after uid drop: %w", errno)
+	}
+	if _, err := os.Stat("/tests/verifier.go"); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return "", "", "", "", errors.New("portable fallback unexpectedly exposes /tests")
+		}
+		return "", "", "", "", fmt.Errorf("portable fallback /tests probe: %w", err)
+	}
+	if _, err := os.Stat("/logs/verifier/reward.txt"); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return "", "", "", "", errors.New("portable fallback unexpectedly exposes /logs")
+		}
+		return "", "", "", "", fmt.Errorf("portable fallback /logs probe: %w", err)
+	}
+	return fallbackTraceweave, fallbackTracegen, fallbackTraceinspect, fallbackCaseRoot, nil
 }
 
 func restrictFilesystem(traceweave, caseRoot string) error {
@@ -1667,6 +1800,7 @@ func runCandidate(binary, workdir string, timeout time.Duration, arguments ...st
 	cmd.Env = candidateEnv
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
+	cmd.Stdin = bytes.NewReader(nil)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Start(); err != nil {
 		return commandResult{}, err
