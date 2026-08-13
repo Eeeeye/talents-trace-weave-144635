@@ -59,10 +59,10 @@ exec > >(tee -a "${log_path}") 2>&1
 [[ -f /tests/verifier.go && ! -L /tests/verifier.go ]] || fail "trusted verifier source is missing or is not regular"
 [[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
 
-# The root verifier shell protects trusted assets, snapshots the submitted
-# tree, and compiles both programs. The semantic verifier keeps trusted
-# observations in this process and launches each candidate child as the
-# predeclared UID 1001, so no image entrypoint or long-lived sidecar is needed.
+# The verifier shell protects trusted assets, snapshots the submitted tree,
+# and compiles both programs. The semantic verifier then enters a Landlock
+# domain before it launches any candidate child. This works even when UID 0
+# has no capabilities and cannot chown files or switch process credentials.
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -98,7 +98,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="f3fccba61717942eeb043375dd5cf2062637e54aa0f6a4e2917ecac8cd202d50"
+  ["Dockerfile"]="be015b111b86cc7cf69b9eef70aaa2908bd230af5ed7a5b9615d145e32ef627b"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -132,7 +132,7 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 
 scratch_parent="/var/lib/traceweave-verifier"
 [[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || fail "image verifier scratch root is missing or unsafe"
-[[ "$(stat -c '%u:%g:%a' "${scratch_parent}" 2>/dev/null || true)" == "0:0:711" ]] || fail "image verifier scratch root has unsafe ownership or mode"
+[[ "$(stat -c '%u:%g:%a' "${scratch_parent}" 2>/dev/null || true)" == "0:0:700" ]] || fail "image verifier scratch root has unsafe ownership or mode"
 scratch="$(/usr/bin/mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXXXXXXXX")"
 [[ -n "${scratch}" && -d "${scratch}" && ! -L "${scratch}" ]] || fail "cannot create verifier scratch directory"
 chmod 0700 "${scratch}"
@@ -148,7 +148,7 @@ binary_root="${scratch}/binaries"
 trusted_runtime_root="${scratch}/trusted-runtime"
 trusted_root="${scratch}/trusted"
 install -d -m 0755 "${source_root}"
-install -d -m 0711 "${binary_root}"
+install -d -m 0700 "${binary_root}"
 install -d -m 0700 "${trusted_root}" "${trusted_runtime_root}"
 install -d -m 0700 \
   "${trusted_runtime_root}/home" "${trusted_runtime_root}/tmp" \
@@ -216,22 +216,14 @@ module_lines="$(cd "${source_root}" && /usr/local/go/bin/go list -m all | sed '1
 )
 for command in tracegen traceweave traceinspect; do
   [[ -f "${binary_root}/${command}" && ! -L "${binary_root}/${command}" ]] || fail "candidate build did not produce ${command}"
-  chmod 0555 "${binary_root}/${command}"
+  chmod 0500 "${binary_root}/${command}"
 done
-chmod 0711 "${scratch}"
-chmod 0711 "${binary_root}"
 
 # Keep generated fixtures in the same root-controlled overlay scratch. They
 # must not consume either the shared /tmp quota or the /logs artifact quota.
 # The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
-install -d -o 1001 -g 1001 -m 0700 "${case_root}"
-if chmod 0700 /tests 2>/dev/null; then
-  printf '[verifier] trusted test mount hidden from candidate uid\n'
-else
-  printf '[verifier] trusted test mount is read-only; fixed source digest verified\n'
-fi
-chmod 0444 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
+install -d -m 0700 "${case_root}"
 printf '[verifier] independent byte-level integration checks\n'
 /usr/bin/timeout --signal=KILL 360s \
   "${scratch}/verifier" \
@@ -243,5 +235,4 @@ printf '[verifier] independent byte-level integration checks\n'
 [[ "$(stat -Lc '%d:%i:%u:%g:%h' "${reward_path}" 2>/dev/null)" == "${reward_identity}" ]] || fail "candidate replaced verifier reward path"
 [[ "$(stat -Lc '%d:%i:%u:%g:%h' "${log_path}" 2>/dev/null)" == "${log_identity}" ]] || fail "candidate replaced verifier log path"
 reward=1
-chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '[verifier] reward=1\n'
