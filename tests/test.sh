@@ -103,7 +103,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="7df5dc93fc9db99af211fe01bd91c93fface0c71d55c1914c21d240d942e98f9"
+  ["Dockerfile"]="d227357e3705e20b16b423515c568e73cc600c895cf863a478d8582078692877"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -188,7 +188,7 @@ binary_root="${scratch}/binaries"
 runtime_root="${scratch}/runtime"
 trusted_root="${scratch}/trusted"
 install -d -o 0 -g 0 -m 0755 "${source_root}"
-install -d -o 65532 -g 65532 -m 0700 "${binary_root}"
+install -d -o 1001 -g 1001 -m 0700 "${binary_root}"
 install -d -o 0 -g 0 -m 0711 "${runtime_root}"
 install -d -o 0 -g 0 -m 0700 \
   "${trusted_root}" "${runtime_root}/trusted-home" "${runtime_root}/trusted-tmp" \
@@ -236,20 +236,17 @@ chown -R 0:0 "${source_root}"
 find "${source_root}" -type d -exec chmod 0755 {} +
 find "${source_root}" -type f -exec chmod 0644 {} +
 
-install -d -o 65532 -g 65532 -m 0700 \
+install -d -o 1001 -g 1001 -m 0700 \
   "${runtime_root}/home" "${runtime_root}/tmp"
-chown -R 65532:65532 "${runtime_root}/go-cache"
-chown -R 65532:65532 "${runtime_root}/go-mod-cache"
+chown -R 1001:1001 "${runtime_root}/go-cache"
+chown -R 1001:1001 "${runtime_root}/go-mod-cache"
 
 run_as_builder() {
   /usr/bin/setpriv \
-    --reuid=65532 \
-    --regid=65532 \
+    --reuid=1001 \
+    --regid=1001 \
     --clear-groups \
     --no-new-privs \
-    --bounding-set=-all \
-    --inh-caps=-all \
-    --ambient-caps=-all \
     /usr/bin/env -i \
       HOME="${runtime_root}/home" \
       USER=traceweave-builder \

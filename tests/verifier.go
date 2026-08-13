@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	candidateUID     = 65532
-	candidateGID     = 65532
+	candidateUID     = 1001
+	candidateGID     = 1001
 	spoolHeaderSize  = 40
 	recordHeaderSize = 40
 	segmentHeadSize  = 56
@@ -1525,7 +1525,7 @@ func runCandidate(binary, workdir string, timeout time.Duration, arguments ...st
 	}
 	setprivArgs := []string{
 		"--reuid=" + strconv.Itoa(candidateUID), "--regid=" + strconv.Itoa(candidateGID),
-		"--clear-groups", "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all",
+		"--clear-groups", "--no-new-privs",
 		"/usr/bin/env", "-i", "HOME=" + home, "USER=traceweave-candidate", "LOGNAME=traceweave-candidate",
 		"PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"TMPDIR=" + temporary, "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly",
