@@ -239,14 +239,32 @@ func sandboxUnavailable(err error) bool {
 		errors.Is(err, syscall.EOPNOTSUPP)
 }
 
+func chownCaseRoot(caseRoot string, candidateID int) error {
+	if err := os.Chmod(caseRoot, 0o700); err != nil && !errors.Is(err, syscall.EPERM) {
+		return fmt.Errorf("set case root permissions: %w", err)
+	}
+	if err := os.Chown(caseRoot, candidateID, candidateID); err != nil && !errors.Is(err, syscall.EPERM) {
+		return fmt.Errorf("transfer case root ownership: %w", err)
+	}
+	info, err := os.Stat(caseRoot)
+	if err != nil {
+		return fmt.Errorf("verify case root ownership: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(candidateID) || stat.Gid != uint32(candidateID) || info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("case root did not transfer with mode 0700: %w", syscall.EPERM)
+	}
+	return nil
+}
+
 // restrictFallback is used on grading workers whose seccomp profile or kernel
 // does not expose Landlock. The semantic verifier has already been compiled
-// from digest-checked source before it reaches this function. Unlink this
-// executable, chroot into the root-owned scratch tree, make the verifier
-// non-dumpable, and permanently drop to an unprivileged identity before any
-// candidate process starts. The read-only /tests mount and writable /logs
-// mount are both outside the chroot, while candidate output remains checked
-// by the in-memory randomized oracle.
+// from digest-checked source before it reaches this function. It unlinks this
+// executable, becomes non-dumpable, and permanently drops to an unprivileged
+// identity before any candidate process starts. A private chroot is preferred.
+// If chroot is blocked too, the trusted shell must already have removed the
+// uploaded /tests and /solution trees; post-drop probes verify that condition
+// and that /logs remains unwritable before the fallback is accepted.
 func restrictFallback(traceweave, tracegen, traceinspect, caseRoot string) (string, string, string, string, error) {
 	const candidateID = 1000
 	if os.Geteuid() != 0 {
@@ -287,13 +305,8 @@ func restrictFallback(traceweave, tracegen, traceinspect, caseRoot string) (stri
 	if err != nil {
 		return "", "", "", "", fmt.Errorf("map case root into fallback root: %w", err)
 	}
-	if err := os.Chown(caseRoot, candidateID, candidateID); err != nil {
-		return "", "", "", "", fmt.Errorf("transfer case root ownership: %w", err)
-	}
-	if info, err := os.Stat(caseRoot); err != nil {
-		return "", "", "", "", fmt.Errorf("verify case root ownership: %w", err)
-	} else if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Uid != candidateID || stat.Gid != candidateID {
-		return "", "", "", "", errors.New("case root ownership did not transfer to fallback user")
+	if err := chownCaseRoot(caseRoot, candidateID); err != nil {
+		return "", "", "", "", err
 	}
 	executable, err := os.Executable()
 	if err != nil {
@@ -308,11 +321,19 @@ func restrictFallback(traceweave, tracegen, traceinspect, caseRoot string) (stri
 	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0); errno != 0 {
 		return "", "", "", "", fmt.Errorf("disable verifier dumpability: %w", errno)
 	}
+	enteredChroot := false
 	if err := syscall.Chroot(chrootRoot); err != nil {
-		return "", "", "", "", fmt.Errorf("enter fallback chroot: %w", err)
-	}
-	if err := os.Chdir(string(filepath.Separator)); err != nil {
-		return "", "", "", "", fmt.Errorf("enter fallback root directory: %w", err)
+		if !sandboxUnavailable(err) {
+			return "", "", "", "", fmt.Errorf("enter fallback chroot: %w", err)
+		}
+		fmt.Printf("[verifier] portable fallback: chroot unavailable (%v); verifying sealed trusted paths\n", err)
+	} else {
+		enteredChroot = true
+		if err := os.Chdir(string(filepath.Separator)); err != nil {
+			return "", "", "", "", fmt.Errorf("enter fallback root directory: %w", err)
+		}
+		traceweave, tracegen, traceinspect, caseRoot =
+			fallbackTraceweave, fallbackTracegen, fallbackTraceinspect, fallbackCaseRoot
 	}
 	if err := syscall.Setgroups([]int{}); err != nil {
 		return "", "", "", "", fmt.Errorf("clear supplementary groups: %w", err)
@@ -339,22 +360,73 @@ func restrictFallback(traceweave, tracegen, traceinspect, caseRoot string) (stri
 	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetDumpable, 0, 0, 0, 0, 0); errno != 0 {
 		return "", "", "", "", fmt.Errorf("restore non-dumpable state after uid drop: %w", errno)
 	}
-	if _, err := os.Stat("/tests/verifier.go"); !errors.Is(err, os.ErrNotExist) {
-		if err == nil {
-			return "", "", "", "", errors.New("portable fallback unexpectedly exposes /tests")
-		}
-		return "", "", "", "", fmt.Errorf("portable fallback /tests probe: %w", err)
+	if err := requireUnreadable("/tests/verifier.go", "tests"); err != nil {
+		return "", "", "", "", err
 	}
-	if _, err := os.Stat("/logs/verifier/reward.txt"); !errors.Is(err, os.ErrNotExist) {
-		if err == nil {
-			return "", "", "", "", errors.New("portable fallback unexpectedly exposes /logs")
-		}
-		return "", "", "", "", fmt.Errorf("portable fallback /logs probe: %w", err)
+	if err := requireUnreadable("/solution/solve.sh", "solution"); err != nil {
+		return "", "", "", "", err
 	}
-	return fallbackTraceweave, fallbackTracegen, fallbackTraceinspect, fallbackCaseRoot, nil
+	if err := requireUnwritable("/logs/verifier/reward.txt", "verifier logs"); err != nil {
+		return "", "", "", "", err
+	}
+	if err := requireNoCreate("/logs/.traceweave-candidate-probe", "logs root"); err != nil {
+		return "", "", "", "", err
+	}
+	if enteredChroot {
+		fmt.Println("[verifier] portable fallback scope: private chroot")
+	} else {
+		fmt.Println("[verifier] portable fallback scope: removed trusted uploads plus permanent privilege drop")
+	}
+	return traceweave, tracegen, traceinspect, caseRoot, nil
+}
+
+func requireUnreadable(path, label string) error {
+	file, err := os.Open(path)
+	if err == nil {
+		file.Close()
+		return fmt.Errorf("portable fallback unexpectedly exposes %s", label)
+	}
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("portable fallback %s probe: %w", label, err)
+	}
+	return nil
+}
+
+func requireUnwritable(path, label string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err == nil {
+		file.Close()
+		return fmt.Errorf("portable fallback unexpectedly permits writing %s", label)
+	}
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("portable fallback %s probe: %w", label, err)
+	}
+	return nil
+}
+
+func requireNoCreate(path, label string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err == nil {
+		file.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("portable fallback unexpectedly permits creating files in %s", label)
+	}
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("portable fallback %s creation probe: %w", label, err)
+	}
+	return nil
 }
 
 func restrictFilesystem(traceweave, caseRoot string) error {
+	const candidateID = 1000
+	dropIdentity := false
+	if os.Geteuid() == 0 {
+		if err := chownCaseRoot(caseRoot, candidateID); err == nil {
+			dropIdentity = true
+		} else if !sandboxUnavailable(err) {
+			return err
+		}
+	}
 	version, _, errno := syscall.Syscall(landlockCreate, 0, 0, 1)
 	if errno != 0 {
 		return fmt.Errorf("landlock ABI query: %w", errno)
@@ -389,16 +461,32 @@ func restrictFilesystem(traceweave, caseRoot string) error {
 	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); errno != 0 {
 		return fmt.Errorf("set no_new_privs: %w", errno)
 	}
+	if _, _, errno := syscall.Syscall(landlockRestrict, rulesetFD, 0, 0); errno != 0 {
+		return fmt.Errorf("landlock restrict self: %w", errno)
+	}
+	if dropIdentity {
+		if err := syscall.Setgroups([]int{}); err != nil {
+			return fmt.Errorf("clear Landlock supplementary groups: %w", err)
+		}
+		if err := syscall.Setgid(candidateID); err != nil {
+			return fmt.Errorf("drop Landlock gid: %w", err)
+		}
+		if err := syscall.Setuid(candidateID); err != nil {
+			return fmt.Errorf("drop Landlock uid: %w", err)
+		}
+	}
 	if err := dropCapabilities(); err != nil {
 		return err
 	}
-	if _, _, errno := syscall.Syscall(landlockRestrict, rulesetFD, 0, 0); errno != 0 {
-		return fmt.Errorf("landlock restrict self: %w", errno)
+	if dropIdentity && (os.Getuid() != candidateID || os.Geteuid() != candidateID ||
+		os.Getgid() != candidateID || os.Getegid() != candidateID) {
+		return fmt.Errorf("Landlock credentials remain uid=%d euid=%d gid=%d egid=%d",
+			os.Getuid(), os.Geteuid(), os.Getgid(), os.Getegid())
 	}
 	if file, err := os.Open("/tests/verifier.go"); err == nil {
 		file.Close()
 		return errors.New("sandbox unexpectedly permits reading /tests")
-	} else if !errors.Is(err, os.ErrPermission) {
+	} else if !errors.Is(err, os.ErrPermission) && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("sandbox /tests probe: %w", err)
 	}
 	if file, err := os.OpenFile("/logs/verifier/reward.txt", os.O_WRONLY, 0); err == nil {

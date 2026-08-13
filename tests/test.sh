@@ -4,6 +4,7 @@ set -Eeuo pipefail
 umask 077
 
 workspace="${TRACE_WEAVE_WORKSPACE:-/workspace/trace-weave}"
+logs_root="/logs"
 verifier_root="/logs/verifier"
 reward_path="${verifier_root}/reward.txt"
 log_path="${verifier_root}/trace-weave-tests.log"
@@ -11,6 +12,12 @@ reward=0
 scratch=""
 reward_identity=""
 log_identity=""
+logs_root_identity=""
+logs_root_owner=""
+logs_root_mode=""
+verifier_root_identity=""
+verifier_root_owner=""
+verifier_root_mode=""
 
 cleanup() {
   if [[ -n "${scratch}" && "${scratch}" == */.traceweave-verifier.* && -d "${scratch}" && ! -L "${scratch}" ]]; then
@@ -23,10 +30,34 @@ finish() {
   trap - EXIT
   set +e
   cleanup
-  if [[ -f "${reward_path}" && ! -L "${reward_path}" &&
-        "$(stat -Lc '%d:%i:%u:%g:%h' "${reward_path}" 2>/dev/null)" == "${reward_identity}" ]]; then
-    chmod 0644 "${reward_path}" >/dev/null 2>&1 || true
-    printf '%s\n' "${reward}" >"${reward_path}" || true
+  logs_root_ok=0
+  verifier_root_ok=0
+  if [[ -d "${logs_root}" && ! -L "${logs_root}" &&
+        "$(stat -Lc '%d:%i:%h' "${logs_root}" 2>/dev/null)" == "${logs_root_identity}" ]]; then
+    logs_root_ok=1
+  fi
+  if (( logs_root_ok == 1 )) && [[ -d "${verifier_root}" && ! -L "${verifier_root}" &&
+        "$(stat -Lc '%d:%i:%h' "${verifier_root}" 2>/dev/null)" == "${verifier_root_identity}" ]]; then
+    verifier_root_ok=1
+  fi
+  if (( verifier_root_ok == 1 )); then
+    if [[ -f "${reward_path}" && ! -L "${reward_path}" &&
+          "$(stat -Lc '%d:%i:%u:%g:%h' "${reward_path}" 2>/dev/null)" == "${reward_identity}" ]]; then
+      chmod 0644 "${reward_path}" >/dev/null 2>&1 || true
+      printf '%s\n' "${reward}" >"${reward_path}" || true
+    fi
+    if [[ -f "${log_path}" && ! -L "${log_path}" &&
+          "$(stat -Lc '%d:%i:%u:%g:%h' "${log_path}" 2>/dev/null)" == "${log_identity}" ]]; then
+      chmod 0644 "${log_path}" >/dev/null 2>&1 || true
+    fi
+    # The directory is sealed only while candidate children exist. Restore its
+    # upload-time ownership and mode so the Harbor host can collect artifacts.
+    chown "${verifier_root_owner}" "${verifier_root}" >/dev/null 2>&1 || true
+    chmod "${verifier_root_mode}" "${verifier_root}" >/dev/null 2>&1 || true
+  fi
+  if (( logs_root_ok == 1 )); then
+    chown "${logs_root_owner}" "${logs_root}" >/dev/null 2>&1 || true
+    chmod "${logs_root_mode}" "${logs_root}" >/dev/null 2>&1 || true
   fi
   exit "${finish_status}"
 }
@@ -36,7 +67,7 @@ fail() {
   exit 1
 }
 
-[[ -d /logs && ! -L /logs ]] || {
+[[ -d "${logs_root}" && ! -L "${logs_root}" ]] || {
   printf 'trace-weave verifier integrity failure: /logs is missing or is not a real directory\n' >&2
   exit 1
 }
@@ -44,6 +75,12 @@ if [[ -L "${verifier_root}" || ! -d "${verifier_root}" ]]; then
   printf 'trace-weave verifier integrity failure: verifier output root is not a real directory\n' >&2
   exit 1
 fi
+logs_root_identity="$(stat -Lc '%d:%i:%h' "${logs_root}")"
+logs_root_owner="$(stat -Lc '%u:%g' "${logs_root}")"
+logs_root_mode="$(stat -Lc '%a' "${logs_root}")"
+verifier_root_identity="$(stat -Lc '%d:%i:%h' "${verifier_root}")"
+verifier_root_owner="$(stat -Lc '%u:%g' "${verifier_root}")"
+verifier_root_mode="$(stat -Lc '%a' "${verifier_root}")"
 rm -f -- "${reward_path}" "${log_path}"
 : >"${reward_path}"
 : >"${log_path}"
@@ -62,8 +99,10 @@ exec > >(tee -a "${log_path}") 2>&1
 # The verifier shell protects trusted assets, snapshots the submitted tree,
 # and compiles both programs. Before launching candidate children, the
 # semantic verifier enters a Landlock domain when available. On workers that
-# block Landlock it instead seals a private chroot and permanently drops to
-# UID/GID 1000; if either safe isolation path is unavailable, grading fails.
+# block Landlock it instead uses a private chroot, or (when chroot is also
+# blocked) requires these trusted trees to have been removed before it
+# permanently drops to UID/GID 1000. If no safe isolation path is available,
+# grading fails.
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -153,7 +192,12 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 (( file_count <= 800 )) || fail "workspace contains too many files: ${file_count}"
 (( byte_count <= 30000000 )) || fail "workspace is unexpectedly large: ${byte_count} bytes"
 
-for scratch_parent in /var/lib/traceweave-verifier /var/tmp /workspace /tmp; do
+# Prefer /var/tmp because the chroot-free portable fallback must remain able to
+# traverse the scratch ancestry after it permanently drops to UID/GID 1000.
+# The random scratch directory itself is later mode 0711, so candidate
+# children can reach only the explicitly transferred cases tree, not list or
+# alter verifier binaries and sources.
+for scratch_parent in /var/tmp /var/lib/traceweave-verifier /workspace /tmp; do
   [[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || continue
   candidate_scratch="$(/usr/bin/mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXXXXXXXX" 2>/dev/null || true)"
   [[ -n "${candidate_scratch}" && -d "${candidate_scratch}" && ! -L "${candidate_scratch}" ]] || continue
@@ -260,9 +304,44 @@ chmod 0711 "${scratch}" "${binary_root}"
 # The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
 install -d -m 0700 "${case_root}"
-chmod 0700 /tests 2>/dev/null || true
-chmod 0600 /tests/verifier.go /tests/verifier.sha256 2>/dev/null || true
-chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
+# Prepare the only candidate-writable tree while the trusted shell still has
+# ownership controls. This also lets the Landlock path run on cap-drop workers;
+# the fallback independently re-verifies the ownership before accepting it.
+if chown 1000:1000 "${case_root}" 2>/dev/null; then
+  chmod 0700 "${case_root}" || fail "cannot seal candidate case root"
+fi
+# Seal verifier output with Unix permissions when the worker grants ownership
+# controls. Capability-free workers can still use Landlock; the semantic
+# verifier checks the effective isolation before it launches any candidate.
+if chown 0:0 "${logs_root}" "${verifier_root}" "${reward_path}" "${log_path}" 2>/dev/null &&
+   chmod 0700 "${logs_root}" "${verifier_root}" 2>/dev/null &&
+   chmod 0600 "${reward_path}" "${log_path}" 2>/dev/null; then
+  printf '[verifier] verifier output sealed with root ownership\n'
+else
+  printf '[verifier] ownership seal unavailable; requiring kernel sandbox\n'
+fi
+
+# Harbor uploads tests and the Oracle solution after the image starts. Most
+# remote workers materialize those uploads as ordinary directories, so remove
+# them after the digest-checked verifier and candidate binaries are compiled.
+# A local Docker backend may expose either path as a mount; never recurse into
+# a mount because it may refer to host data. In that case Landlock or chroot
+# must hide it, and the verifier's post-drop probes fail closed otherwise.
+seal_trusted_tree() {
+  trusted_path="$1"
+  [[ -e "${trusted_path}" || -L "${trusted_path}" ]] || return 0
+  [[ -d "${trusted_path}" && ! -L "${trusted_path}" ]] || fail "trusted path is not a real directory: ${trusted_path}"
+  if mountpoint -q -- "${trusted_path}"; then
+    printf '[verifier] trusted mount retained for kernel sandbox: %s\n' "${trusted_path}"
+    return 0
+  fi
+  rm -rf --one-file-system -- "${trusted_path}"
+  [[ ! -e "${trusted_path}" && ! -L "${trusted_path}" ]] || fail "could not remove trusted path: ${trusted_path}"
+  printf '[verifier] removed trusted upload before candidate execution: %s\n' "${trusted_path}"
+}
+
+seal_trusted_tree /solution
+seal_trusted_tree /tests
 printf '[verifier] independent byte-level integration checks\n'
 /usr/bin/timeout --signal=KILL 360s \
   "${scratch}/verifier" \
