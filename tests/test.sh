@@ -53,7 +53,7 @@ exec > >(tee -a "${log_path}") 2>&1
 
 [[ -d "${workspace}" && ! -L "${workspace}" ]] || fail "workspace is missing or is a symlink"
 [[ -d /tests && ! -L /tests ]] || fail "verifier tests are missing or are a symlink"
-[[ -f /tests/verifier && ! -L /tests/verifier ]] || fail "trusted verifier binary is missing or is not regular"
+[[ -f /tests/verifier.go && ! -L /tests/verifier.go ]] || fail "trusted verifier source is missing or is not regular"
 [[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
 
 # Protect trusted assets before inspecting anything supplied by the candidate.
@@ -186,21 +186,44 @@ chmod 0711 "${scratch}"
 source_root="${scratch}/source"
 binary_root="${scratch}/binaries"
 runtime_root="${scratch}/runtime"
+trusted_root="${scratch}/trusted"
 install -d -o 0 -g 0 -m 0755 "${source_root}"
 install -d -o 65532 -g 65532 -m 0700 "${binary_root}"
 install -d -o 0 -g 0 -m 0711 "${runtime_root}"
 install -d -o 0 -g 0 -m 0700 \
+  "${trusted_root}" "${runtime_root}/trusted-home" "${runtime_root}/trusted-tmp" \
   "${runtime_root}/go-cache" "${runtime_root}/go-mod-cache"
 
-# The independent Oracle is compiled with the image's pinned Go 1.22.12
-# toolchain during task authoring. Verify its byte digest before copying it out
-# of the read-only /tests mount; this removes all runtime compiler/cache
-# dependence from the trusted side of the grading boundary.
+# The grading fleet may use either amd64 or arm64 workers. Verify the fixed
+# Oracle source and compile it with the image's pinned native Go toolchain so
+# the trusted executable always matches the worker architecture. This happens
+# before ownership of the build cache is dropped to the candidate builder.
 expected_verifier_sha="$(awk 'NR == 1 {print $1}' /tests/verifier.sha256)"
 [[ "${expected_verifier_sha}" =~ ^[0-9a-f]{64}$ ]] || fail "trusted verifier digest has an invalid format"
-observed_verifier_sha="$(sha256sum -- /tests/verifier | awk '{print $1}')"
-[[ "${observed_verifier_sha}" == "${expected_verifier_sha}" ]] || fail "trusted verifier binary digest mismatch"
-install -o 0 -g 0 -m 0500 /tests/verifier "${scratch}/verifier"
+observed_verifier_sha="$(sha256sum -- /tests/verifier.go | awk '{print $1}')"
+[[ "${observed_verifier_sha}" == "${expected_verifier_sha}" ]] || fail "trusted verifier source digest mismatch"
+install -o 0 -g 0 -m 0600 /tests/verifier.go "${trusted_root}/verifier.go"
+(
+  cd "${trusted_root}"
+  /usr/bin/env -i \
+    HOME="${runtime_root}/trusted-home" \
+    PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    TMPDIR="${runtime_root}/trusted-tmp" \
+    GOPROXY=off \
+    GOSUMDB=off \
+    GOTOOLCHAIN=local \
+    GOFLAGS=-mod=readonly \
+    GOENV=off \
+    CGO_ENABLED=0 \
+    GOCACHE="${runtime_root}/go-cache" \
+    GOMODCACHE="${runtime_root}/go-mod-cache" \
+    /usr/bin/timeout --signal=KILL 180s \
+      /usr/local/go/bin/go build -trimpath -buildvcs=false \
+        -o "${scratch}/verifier" "${trusted_root}/verifier.go"
+)
+chown 0:0 "${scratch}/verifier"
+chmod 0500 "${scratch}/verifier"
+rm -f -- "${trusted_root}/verifier.go"
 
 tar \
   --exclude='./.git' \
