@@ -21,8 +21,8 @@ finish() {
   trap - EXIT
   set +e
   cleanup
+  chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
   printf '%s\n' "${reward}" >"${reward_path}"
-  chmod 0644 "${reward_path}" >/dev/null 2>&1 || true
   exit "${finish_status}"
 }
 
@@ -52,9 +52,10 @@ exec > >(tee -a "${log_path}") 2>&1
 [[ -f /tests/verifier.go && ! -L /tests/verifier.go ]] || fail "trusted verifier source is missing or is not regular"
 [[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
 
-# The verifier never uses root capabilities: it inspects the submitted tree in
-# place, then copies it into an image-owned staging root. The independent Go
-# process later enters a Landlock domain before it starts any candidate binary.
+# The root shell protects trusted assets, inspects the submitted tree, and
+# compiles both programs. The independent semantic verifier then runs as the
+# image-declared UID 1001, so it and every candidate child are unable to read
+# /tests, modify /logs, or depend on root capabilities and optional syscalls.
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -90,7 +91,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="4845a1ff569a614b77f8969adc19e19f9874d290f14538a4d14e6d115d0aa5aa"
+  ["Dockerfile"]="f2ac225fb589381d03492ae084d82ca102e93cdab9fc3825114c79c2f70ea790"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -124,7 +125,7 @@ byte_count="$(find "${workspace}" -xdev -type f -printf '%s\n' | awk '{sum += $1
 
 scratch_parent="/var/lib/traceweave-verifier"
 [[ -d "${scratch_parent}" && ! -L "${scratch_parent}" ]] || fail "image verifier scratch root is missing or unsafe"
-[[ "$(stat -c '%u:%g:%a' "${scratch_parent}" 2>/dev/null || true)" == "0:0:700" ]] || fail "image verifier scratch root has unsafe ownership or mode"
+[[ "$(stat -c '%u:%g:%a' "${scratch_parent}" 2>/dev/null || true)" == "0:0:711" ]] || fail "image verifier scratch root has unsafe ownership or mode"
 scratch="$(/usr/bin/mktemp -d "${scratch_parent}/.traceweave-verifier.XXXXXXXXXXXX")"
 [[ -n "${scratch}" && -d "${scratch}" && ! -L "${scratch}" ]] || fail "cannot create verifier scratch directory"
 chmod 0700 "${scratch}"
@@ -140,7 +141,7 @@ binary_root="${scratch}/binaries"
 trusted_runtime_root="${scratch}/trusted-runtime"
 trusted_root="${scratch}/trusted"
 install -d -m 0755 "${source_root}"
-install -d -m 0700 "${binary_root}"
+install -d -m 0711 "${binary_root}"
 install -d -m 0700 "${trusted_root}" "${trusted_runtime_root}"
 install -d -m 0700 \
   "${trusted_runtime_root}/home" "${trusted_runtime_root}/tmp" \
@@ -208,20 +209,32 @@ module_lines="$(cd "${source_root}" && /usr/local/go/bin/go list -m all | sed '1
 )
 for command in tracegen traceweave traceinspect; do
   [[ -f "${binary_root}/${command}" && ! -L "${binary_root}/${command}" ]] || fail "candidate build did not produce ${command}"
-  chmod 0500 "${binary_root}/${command}"
+  chmod 0555 "${binary_root}/${command}"
 done
+chmod 0711 "${scratch}"
+chmod 0711 "${binary_root}"
 
 # Keep generated fixtures in the same root-controlled overlay scratch. They
 # must not consume either the shared /tmp quota or the /logs artifact quota.
 # The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
-install -d -m 0700 "${case_root}"
+install -d -o 1001 -g 1001 -m 0700 "${case_root}"
+chown 1001:1001 "${scratch}/verifier"
+chmod 0500 "${scratch}/verifier"
+chmod 0000 /tests/verifier.go /tests/verifier.sha256
+chmod 0444 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '[verifier] independent byte-level integration checks\n'
-"${scratch}/verifier" \
-  "${binary_root}/traceweave" \
-  "${binary_root}/tracegen" \
-  "${binary_root}/traceinspect" \
-  "${case_root}"
+/usr/bin/setpriv \
+  --reuid=1001 \
+  --regid=1001 \
+  --clear-groups \
+  --no-new-privs \
+  "${scratch}/verifier" \
+    "${binary_root}/traceweave" \
+    "${binary_root}/tracegen" \
+    "${binary_root}/traceinspect" \
+    "${case_root}"
 
 reward=1
+chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '[verifier] reward=1\n'
