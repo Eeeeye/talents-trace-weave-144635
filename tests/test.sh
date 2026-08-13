@@ -9,6 +9,8 @@ reward_path="${verifier_root}/reward.txt"
 log_path="${verifier_root}/trace-weave-tests.log"
 reward=0
 scratch=""
+reward_identity=""
+log_identity=""
 
 cleanup() {
   if [[ -n "${scratch}" && "${scratch}" == */.traceweave-verifier.* && -d "${scratch}" && ! -L "${scratch}" ]]; then
@@ -21,8 +23,11 @@ finish() {
   trap - EXIT
   set +e
   cleanup
-  chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
-  printf '%s\n' "${reward}" >"${reward_path}"
+  if [[ -f "${reward_path}" && ! -L "${reward_path}" &&
+        "$(stat -Lc '%d:%i:%u:%g:%h' "${reward_path}" 2>/dev/null)" == "${reward_identity}" ]]; then
+    chmod 0644 "${reward_path}" >/dev/null 2>&1 || true
+    printf '%s\n' "${reward}" >"${reward_path}" || true
+  fi
   exit "${finish_status}"
 }
 
@@ -44,6 +49,8 @@ rm -f -- "${reward_path}" "${log_path}"
 : >"${log_path}"
 chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '0\n' >"${reward_path}"
+reward_identity="$(stat -Lc '%d:%i:%u:%g:%h' "${reward_path}")"
+log_identity="$(stat -Lc '%d:%i:%u:%g:%h' "${log_path}")"
 trap finish EXIT
 exec > >(tee -a "${log_path}") 2>&1
 
@@ -53,9 +60,9 @@ exec > >(tee -a "${log_path}") 2>&1
 [[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
 
 # The root shell protects trusted assets, inspects the submitted tree, and
-# compiles both programs. The independent semantic verifier then runs as the
-# image-declared UID 1001, so it and every candidate child are unable to read
-# /tests, modify /logs, or depend on root capabilities and optional syscalls.
+# compiles both programs. The independent semantic verifier is executed by the
+# image-started UID 1001 runner, so no runtime ownership or identity-changing
+# syscall is required from this capability-free verifier process.
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -91,7 +98,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="f2ac225fb589381d03492ae084d82ca102e93cdab9fc3825114c79c2f70ea790"
+  ["Dockerfile"]="224ea3e3ca2a1976b205ceb652e7cb1fa3b3abf78802f00e8ee3e0849e9b79e4"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -173,7 +180,7 @@ install -m 0600 /tests/verifier.go "${trusted_root}/verifier.go"
       /usr/local/go/bin/go build -trimpath -buildvcs=false \
         -o "${scratch}/verifier" "${trusted_root}/verifier.go"
 )
-chmod 0500 "${scratch}/verifier"
+chmod 0555 "${scratch}/verifier"
 rm -f -- "${trusted_root}/verifier.go"
 
 tar \
@@ -218,23 +225,24 @@ chmod 0711 "${binary_root}"
 # must not consume either the shared /tmp quota or the /logs artifact quota.
 # The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
-install -d -o 1001 -g 1001 -m 0700 "${case_root}"
-chown 1001:1001 "${scratch}/verifier"
-chmod 0500 "${scratch}/verifier"
-chmod 0000 /tests/verifier.go /tests/verifier.sha256
+install -d -m 0707 "${case_root}"
+if chmod 0700 /tests 2>/dev/null; then
+  printf '[verifier] trusted test mount hidden from candidate uid\n'
+else
+  printf '[verifier] trusted test mount is read-only; fixed source digest verified\n'
+fi
 chmod 0444 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '[verifier] independent byte-level integration checks\n'
-/usr/bin/setpriv \
-  --reuid=1001 \
-  --regid=1001 \
-  --clear-groups \
-  --no-new-privs \
-  "${scratch}/verifier" \
+/usr/bin/timeout --signal=KILL 360s \
+  /usr/local/bin/traceweave-verifier-runner run -- \
+    "${scratch}/verifier" \
     "${binary_root}/traceweave" \
     "${binary_root}/tracegen" \
     "${binary_root}/traceinspect" \
     "${case_root}"
 
+[[ "$(stat -Lc '%d:%i:%u:%g:%h' "${reward_path}" 2>/dev/null)" == "${reward_identity}" ]] || fail "candidate replaced verifier reward path"
+[[ "$(stat -Lc '%d:%i:%u:%g:%h' "${log_path}" 2>/dev/null)" == "${log_identity}" ]] || fail "candidate replaced verifier log path"
 reward=1
 chmod 0644 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '[verifier] reward=1\n'

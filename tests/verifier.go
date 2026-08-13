@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -28,6 +29,8 @@ const (
 	recordHeaderSize = 40
 	segmentHeadSize  = 56
 )
+
+var runNonce uint64
 
 type event struct {
 	Epoch     uint64
@@ -134,14 +137,15 @@ func main() {
 		os.Exit(2)
 	}
 	traceweave, tracegen, traceinspect, caseRoot := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+	if err := binary.Read(rand.Reader, binary.BigEndian, &runNonce); err != nil {
+		fatal(fmt.Errorf("verifier nonce: %w", err))
+	}
 	if err := os.MkdirAll(caseRoot, 0o711); err != nil {
 		fatal(err)
 	}
-	if file, err := os.Open("/tests/verifier.go"); err == nil {
-		file.Close()
-		fatal(errors.New("candidate identity unexpectedly permits reading /tests"))
-	} else if !errors.Is(err, os.ErrPermission) {
-		fatal(fmt.Errorf("candidate identity /tests probe: %w", err))
+	if os.Getuid() != candidateUID || os.Getgid() != candidateGID {
+		fatal(fmt.Errorf("candidate identity is uid/gid %d:%d, want %d:%d",
+			os.Getuid(), os.Getgid(), candidateUID, candidateGID))
 	}
 	if file, err := os.OpenFile("/logs/verifier/reward.txt", os.O_WRONLY, 0); err == nil {
 		file.Close()
@@ -1147,6 +1151,8 @@ func createDataset(root, job string, byRank [][]event, delays map[uint32]int, op
 }
 
 func makeRecords(epoch uint64, counts []int, salt uint64) [][]event {
+	epoch ^= runNonce
+	salt ^= runNonce >> 17
 	result := make([][]event, len(counts))
 	for rank, count := range counts {
 		for index := 0; index < count; index++ {
