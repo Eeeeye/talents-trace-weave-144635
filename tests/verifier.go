@@ -140,20 +140,13 @@ func main() {
 	if err := binary.Read(rand.Reader, binary.BigEndian, &runNonce); err != nil {
 		fatal(fmt.Errorf("verifier nonce: %w", err))
 	}
-	if err := os.MkdirAll(caseRoot, 0o711); err != nil {
+	if os.Getuid() != 0 || os.Getgid() != 0 {
+		fatal(fmt.Errorf("verifier identity is uid/gid %d:%d, want root", os.Getuid(), os.Getgid()))
+	}
+	if err := os.MkdirAll(caseRoot, 0o700); err != nil {
 		fatal(err)
 	}
-	if os.Getuid() != candidateUID || os.Getgid() != candidateGID {
-		fatal(fmt.Errorf("candidate identity is uid/gid %d:%d, want %d:%d",
-			os.Getuid(), os.Getgid(), candidateUID, candidateGID))
-	}
-	if file, err := os.OpenFile("/logs/verifier/reward.txt", os.O_WRONLY, 0); err == nil {
-		file.Close()
-		fatal(errors.New("candidate identity unexpectedly permits writing /logs"))
-	} else if !errors.Is(err, os.ErrPermission) {
-		fatal(fmt.Errorf("candidate identity /logs probe: %w", err))
-	}
-	fmt.Println("[verifier] candidate isolation: dedicated uid")
+	fmt.Println("[verifier] candidate isolation: per-command uid")
 
 	tests := []struct {
 		name string
@@ -1549,7 +1542,14 @@ func runCandidate(binary, workdir string, timeout time.Duration, arguments ...st
 	cmd := exec.Command(binary, arguments...)
 	cmd.Dir = workdir
 	cmd.Env = candidateEnv
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+		Credential: &syscall.Credential{
+			Uid:         candidateUID,
+			Gid:         candidateGID,
+			NoSetGroups: true,
+		},
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Start(); err != nil {
@@ -1663,7 +1663,7 @@ func chownTree(root string, uid, gid int) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("fixture unexpectedly contains symlink %s", path)
 		}
-		return nil
+		return os.Chown(path, uid, gid)
 	})
 }
 

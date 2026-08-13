@@ -59,10 +59,10 @@ exec > >(tee -a "${log_path}") 2>&1
 [[ -f /tests/verifier.go && ! -L /tests/verifier.go ]] || fail "trusted verifier source is missing or is not regular"
 [[ -f /tests/verifier.sha256 && ! -L /tests/verifier.sha256 ]] || fail "trusted verifier digest is missing or is not regular"
 
-# The root shell protects trusted assets, inspects the submitted tree, and
-# compiles both programs. The independent semantic verifier is executed by the
-# image-started UID 1001 runner, so no runtime ownership or identity-changing
-# syscall is required from this capability-free verifier process.
+# The root verifier shell protects trusted assets, snapshots the submitted
+# tree, and compiles both programs. The semantic verifier keeps trusted
+# observations in this process and launches each candidate child as the
+# predeclared UID 1001, so no image entrypoint or long-lived sidecar is needed.
 
 while IFS= read -r -d '' entry; do
   name="$(basename -- "${entry}")"
@@ -98,7 +98,7 @@ done < <(find "${workspace}" -xdev -type f -name '*_test.go' -print0)
 declare -A protected_hashes=(
   [".dockerignore"]="f3f977655f1f084c9172e0b910866418d469e3d61c13eb9b0c508ab5164e4f00"
   [".gitignore"]="2c5e6dd3904895964b3ba38bf98e42027ec449b1b3c5ee194731c196e2f367f3"
-  ["Dockerfile"]="224ea3e3ca2a1976b205ceb652e7cb1fa3b3abf78802f00e8ee3e0849e9b79e4"
+  ["Dockerfile"]="f3fccba61717942eeb043375dd5cf2062637e54aa0f6a4e2917ecac8cd202d50"
   ["LICENSE"]="52f28a21801fdf1614167b3fdceac61a3bacc67544c553c8b63582d6b416bd5f"
   ["README.md"]="0733493db1e9790d77fd882b74d7d7ed49a4d40989baf56e9af9c0043acc2357"
   ["go.mod"]="50806758d0ee4a0f527562c57daf90f4a5e0bbe8a22e5469a372a5ef110e2c50"
@@ -225,7 +225,7 @@ chmod 0711 "${binary_root}"
 # must not consume either the shared /tmp quota or the /logs artifact quota.
 # The EXIT trap removes the complete scratch tree.
 case_root="${scratch}/cases"
-install -d -m 0707 "${case_root}"
+install -d -o 1001 -g 1001 -m 0700 "${case_root}"
 if chmod 0700 /tests 2>/dev/null; then
   printf '[verifier] trusted test mount hidden from candidate uid\n'
 else
@@ -234,12 +234,11 @@ fi
 chmod 0444 "${reward_path}" "${log_path}" >/dev/null 2>&1 || true
 printf '[verifier] independent byte-level integration checks\n'
 /usr/bin/timeout --signal=KILL 360s \
-  /usr/local/bin/traceweave-verifier-runner run -- \
-    "${scratch}/verifier" \
-    "${binary_root}/traceweave" \
-    "${binary_root}/tracegen" \
-    "${binary_root}/traceinspect" \
-    "${case_root}"
+  "${scratch}/verifier" \
+  "${binary_root}/traceweave" \
+  "${binary_root}/tracegen" \
+  "${binary_root}/traceinspect" \
+  "${case_root}"
 
 [[ "$(stat -Lc '%d:%i:%u:%g:%h' "${reward_path}" 2>/dev/null)" == "${reward_identity}" ]] || fail "candidate replaced verifier reward path"
 [[ "$(stat -Lc '%d:%i:%u:%g:%h' "${log_path}" 2>/dev/null)" == "${log_identity}" ]] || fail "candidate replaced verifier log path"
